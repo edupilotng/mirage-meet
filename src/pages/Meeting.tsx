@@ -40,8 +40,6 @@ export default function Meeting() {
     cleanup: cleanupTransform,
   } = useFaceTransform();
 
-  const actualLocalStream = processedStream || null;
-
   useEffect(() => {
     processedStreamRef.current = processedStream;
   }, [processedStream]);
@@ -60,6 +58,8 @@ export default function Meeting() {
   } = useWebRTC(roomId || null, processedStreamRef.current);
 
   const displayNameRef = useRef<HTMLInputElement>(null);
+
+  const actualLocalStream = processedStreamRef.current || localStream;
 
   useEffect(() => {
     socket.connect();
@@ -100,6 +100,16 @@ export default function Meeting() {
       transformInitializedRef.current = true;
     }
   }, [localStream, initializeTransform]);
+
+  useEffect(() => {
+    if (referenceVideo && transformationSettings.enabled) {
+      setStatusMessage('Transformation Active');
+    }
+  }, [referenceVideo, transformationSettings.enabled]);
+
+  const setStatusMessage = useCallback((message: string) => {
+    console.log('Status:', message);
+  }, []);
 
   const formatDuration = (seconds: number) => {
     const hrs = Math.floor(seconds / 3600);
@@ -251,8 +261,18 @@ export default function Meeting() {
         </div>
 
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 px-3 py-1.5 bg-dark-800 rounded-lg">
-            <div className={`w-2 h-2 rounded-full ${statusMessage.includes('Active') || statusMessage.includes('Ready') ? 'bg-green-500' : statusMessage.includes('Loading') ? 'bg-yellow-500' : 'bg-red-500'}`} />
+          <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${
+            statusMessage.includes('Active')
+              ? 'bg-primary-500/20 border border-primary-500/30'
+              : 'bg-dark-800 border border-dark-700'
+          }`}>
+            <div className={`w-2 h-2 rounded-full ${
+              statusMessage.includes('Active') || statusMessage.includes('Ready')
+                ? 'bg-green-500'
+                : statusMessage.includes('Loading')
+                ? 'bg-yellow-500'
+                : 'bg-dark-500'
+            }`} />
             <span className="text-xs text-dark-300">{statusMessage}</span>
           </div>
           {isAdmin && (
@@ -304,7 +324,7 @@ export default function Meeting() {
             }`}
           >
             <VideoFrame
-              stream={actualLocalStream || localStream}
+              stream={actualLocalStream}
               participant={{
                 id: 'local',
                 displayName,

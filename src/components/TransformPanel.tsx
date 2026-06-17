@@ -1,4 +1,4 @@
-import { Upload, X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader } from 'lucide-react';
+import { Upload, X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader, Sparkles } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import type { TransformationSettings } from '../types';
 import { backgroundOptions } from '../hooks/useFaceTransform';
@@ -27,6 +27,7 @@ export default function TransformPanel({
   const [isDragging, setIsDragging] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
+  const [errorMessage, setErrorMessage] = useState<string>('');
   const videoInputRef = useRef<HTMLInputElement>(null);
   const previewVideoRef = useRef<HTMLVideoElement>(null);
 
@@ -40,9 +41,12 @@ export default function TransformPanel({
 
   const handleVideoUpload = (file: File) => {
     setUploadStatus('loading');
+    setErrorMessage('');
+
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
     }
+
     const url = URL.createObjectURL(file);
     setPreviewUrl(url);
 
@@ -51,22 +55,26 @@ export default function TransformPanel({
     video.loop = true;
     video.muted = true;
     video.playsInline = true;
+    video.crossOrigin = 'anonymous';
+
+    video.onloadedmetadata = () => {
+      video.play().catch(() => {});
+    };
 
     video.onloadeddata = () => {
-      video.play().catch(() => {});
       setUploadStatus('success');
+      setReferenceVideo(video);
+
+      setTransformationSettings(prev => ({
+        ...prev,
+        referenceVideo: url,
+      }));
     };
 
     video.onerror = () => {
       setUploadStatus('error');
+      setErrorMessage('Failed to load video. Try a different format.');
     };
-
-    setReferenceVideo(video);
-
-    setTransformationSettings(prev => ({
-      ...prev,
-      referenceVideo: url,
-    }));
   };
 
   const handleDrop = (e: React.DragEvent) => {
@@ -91,6 +99,7 @@ export default function TransformPanel({
     }
     setPreviewUrl(null);
     setUploadStatus('idle');
+    setErrorMessage('');
     setReferenceVideo(null);
     setTransformationSettings(prev => ({
       ...prev,
@@ -106,11 +115,21 @@ export default function TransformPanel({
     }));
   };
 
+  const getStatusColor = () => {
+    if (statusMessage.includes('Active') || statusMessage.includes('Ready')) return 'text-green-400';
+    if (statusMessage.includes('Loading') || uploadStatus === 'loading') return 'text-yellow-400';
+    if (statusMessage.includes('Failed') || statusMessage.includes('Error')) return 'text-red-400';
+    return 'text-dark-300';
+  };
+
   const getStatusIcon = () => {
     if (statusMessage.includes('Loading') || uploadStatus === 'loading') {
       return <Loader size={14} className="text-yellow-400 animate-spin" />;
     }
-    if (statusMessage.includes('Active') || statusMessage.includes('Ready') || statusMessage.includes('Success')) {
+    if (statusMessage.includes('Active')) {
+      return <Sparkles size={14} className="text-primary-400" />;
+    }
+    if (statusMessage.includes('Ready') || uploadStatus === 'success') {
       return <CheckCircle size={14} className="text-green-400" />;
     }
     if (statusMessage.includes('Failed') || statusMessage.includes('Error')) {
@@ -139,24 +158,24 @@ export default function TransformPanel({
       </button>
 
       <div className="h-full overflow-y-auto p-4">
-        <h2 className="text-lg font-semibold text-white mb-2">Transformation Controls</h2>
+        <h2 className="text-lg font-semibold text-white mb-2">AI Transformation</h2>
         <p className="text-xs text-dark-400 mb-4">
-          Upload a reference video to enable face transformation. Only visible to you.
+          Upload a reference video to transform your appearance. The AI will map the face from the video onto your webcam feed.
         </p>
 
-        <div className="mb-4 flex items-center gap-2 px-3 py-2 bg-dark-800 rounded-lg">
+        <div className="mb-4 flex items-center gap-2 px-3 py-2 bg-dark-800 rounded-lg border border-dark-700">
           {getStatusIcon()}
-          <span className="text-xs text-dark-300">{statusMessage}</span>
+          <span className={`text-xs ${getStatusColor()}`}>{statusMessage}</span>
         </div>
 
         <div className="space-y-6">
           <div>
             <label className="text-sm font-medium text-dark-300 block mb-2">
-              Reference Video
+              Reference Video (Face Source)
             </label>
             <div
-              className={`relative border-2 border-dashed rounded-lg p-4 transition-colors ${
-                isDragging ? 'border-primary-400 bg-primary-400/10' : 'border-dark-600'
+              className={`relative border-2 border-dashed rounded-lg p-4 transition-colors cursor-pointer ${
+                isDragging ? 'border-primary-400 bg-primary-400/10' : 'border-dark-600 hover:border-dark-500'
               } ${previewUrl ? 'border-primary-500' : ''}`}
               onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
               onDragLeave={() => setIsDragging(false)}
@@ -175,15 +194,15 @@ export default function TransformPanel({
                     playsInline
                   />
                   {uploadStatus === 'success' && (
-                    <div className="absolute top-2 left-2 px-2 py-1 bg-green-500/80 rounded text-xs text-white flex items-center gap-1">
+                    <div className="absolute top-2 left-2 px-2 py-1 bg-green-500/90 rounded text-xs text-white flex items-center gap-1">
                       <CheckCircle size={12} />
-                      Upload Successful
+                      Video Loaded
                     </div>
                   )}
                   {uploadStatus === 'error' && (
-                    <div className="absolute top-2 left-2 px-2 py-1 bg-red-500/80 rounded text-xs text-white flex items-center gap-1">
+                    <div className="absolute top-2 left-2 px-2 py-1 bg-red-500/90 rounded text-xs text-white flex items-center gap-1">
                       <AlertCircle size={12} />
-                      Upload Failed
+                      {errorMessage || 'Upload Failed'}
                     </div>
                   )}
                   <button
@@ -198,7 +217,7 @@ export default function TransformPanel({
                   {uploadStatus === 'loading' ? (
                     <div className="flex flex-col items-center">
                       <Loader size={24} className="text-primary-400 animate-spin mb-2" />
-                      <p className="text-sm text-dark-400">Uploading...</p>
+                      <p className="text-sm text-dark-400">Processing video...</p>
                     </div>
                   ) : (
                     <>
@@ -207,7 +226,7 @@ export default function TransformPanel({
                         Drag & drop video or click to upload
                       </p>
                       <p className="text-xs text-dark-500 mt-1">
-                        MP4, WebM supported
+                        MP4, WebM, MOV supported
                       </p>
                     </>
                   )}
@@ -221,6 +240,9 @@ export default function TransformPanel({
                 onChange={handleFileSelect}
               />
             </div>
+            <p className="text-xs text-dark-500 mt-2">
+              Upload a video containing a face. The AI will extract and apply facial features.
+            </p>
           </div>
 
           <div>
@@ -240,7 +262,7 @@ export default function TransformPanel({
                 >
                   {bg.id === 'none' ? (
                     <div className="w-full h-full bg-dark-700 flex items-center justify-center">
-                      <span className="text-xs text-dark-400">No Background</span>
+                      <span className="text-xs text-dark-400">None</span>
                     </div>
                   ) : (
                     <img
@@ -251,7 +273,9 @@ export default function TransformPanel({
                       onError={(e) => {
                         const target = e.target as HTMLImageElement;
                         target.style.display = 'none';
-                        target.parentElement!.innerHTML = `<div class="w-full h-full bg-dark-700 flex items-center justify-center"><span class="text-xs text-dark-400">${bg.name}</span></div>`;
+                        if (target.parentElement) {
+                          target.parentElement.innerHTML = `<div class="w-full h-full bg-dark-700 flex items-center justify-center"><span class="text-xs text-dark-400">${bg.name}</span></div>`;
+                        }
                       }}
                     />
                   )}
@@ -269,24 +293,35 @@ export default function TransformPanel({
                 onClick={toggleTransformation}
                 className={`w-full py-3 px-4 rounded-lg font-medium transition-all flex items-center justify-center gap-2 ${
                   transformationSettings.enabled
-                    ? 'bg-primary-500 text-white hover:bg-primary-600'
-                    : 'bg-dark-700 text-dark-300 hover:bg-dark-600'
+                    ? 'bg-primary-500 text-white hover:bg-primary-600 shadow-lg shadow-primary-500/20'
+                    : 'bg-dark-700 text-dark-300 hover:bg-dark-600 hover:text-white'
                 }`}
               >
                 {transformationSettings.enabled ? (
                   <>
-                    <CheckCircle size={16} />
+                    <Sparkles size={16} />
                     Transformation Active
                   </>
                 ) : (
-                  'Enable Transformation'
+                  <>
+                    <Sparkles size={16} className="opacity-50" />
+                    Enable Face Transformation
+                  </>
                 )}
               </button>
               <p className="text-xs text-dark-400 mt-2 text-center">
                 {transformationSettings.enabled
-                  ? 'Your face is being transformed based on reference'
-                  : 'Toggle to start face transformation'}
+                  ? 'AI is transforming your face using the reference video. Move your head for best results.'
+                  : 'Click to activate AI-powered face transformation'}
               </p>
+
+              {transformationSettings.enabled && (
+                <div className="mt-3 p-2 bg-primary-500/10 border border-primary-500/20 rounded-lg">
+                  <p className="text-xs text-primary-300">
+                    Tip: For best results, ensure good lighting and face the camera directly. The AI tracks your face position and applies the reference features.
+                  </p>
+                </div>
+              )}
             </div>
           )}
         </div>
