@@ -36,8 +36,8 @@ export default function Meeting() {
     processedStream,
     transformationSettings,
     setTransformationSettings,
-    referenceVideo,
-    setReferenceVideo,
+    referenceImage,
+    setReferenceImage,
     initializeTransform,
     updateBackground,
     statusMessage,
@@ -361,8 +361,8 @@ export default function Meeting() {
           <TransformPanel
             transformationSettings={transformationSettings}
             setTransformationSettings={setTransformationSettings}
-            referenceVideo={referenceVideo}
-            setReferenceVideo={setReferenceVideo}
+            referenceImage={referenceImage}
+            setReferenceImage={setReferenceImage}
             onBackgroundChange={updateBackground}
             isCollapsed={panelCollapsed}
             onToggleCollapse={() => setPanelCollapsed(!panelCollapsed)}

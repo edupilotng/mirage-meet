@@ -21,7 +21,7 @@ export interface SignalData {
 
 export interface TransformationSettings {
   enabled: boolean;
-  referenceVideo: string | null;
+  referenceImage: string | null;
   background: string;
   modelLoadProgress?: number;
 }

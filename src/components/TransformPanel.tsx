@@ -1,4 +1,4 @@
-import { Upload, X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader, Sparkles } from 'lucide-react';
+import { Upload, X, ChevronLeft, ChevronRight, CheckCircle, AlertCircle, Loader, Sparkles, Image } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import type { TransformationSettings } from '../types';
 import { backgroundOptions } from '../hooks/useFaceTransform';
@@ -6,8 +6,8 @@ import { backgroundOptions } from '../hooks/useFaceTransform';
 interface TransformPanelProps {
   transformationSettings: TransformationSettings;
   setTransformationSettings: React.Dispatch<React.SetStateAction<TransformationSettings>>;
-  referenceVideo: HTMLVideoElement | null;
-  setReferenceVideo: (video: HTMLVideoElement | null) => void;
+  referenceImage: HTMLImageElement | null;
+  setReferenceImage: (img: HTMLImageElement | null) => void;
   onBackgroundChange: (backgroundId: string) => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
@@ -18,8 +18,8 @@ interface TransformPanelProps {
 export default function TransformPanel({
   transformationSettings,
   setTransformationSettings,
-  referenceVideo: _referenceVideo,
-  setReferenceVideo,
+  referenceImage: _referenceImage,
+  setReferenceImage,
   onBackgroundChange,
   isCollapsed,
   onToggleCollapse,
@@ -31,7 +31,7 @@ export default function TransformPanel({
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Cleanup preview URL on unmount or when cleared
+  // Cleanup preview URL on unmount
   useEffect(() => {
     return () => {
       if (previewUrl) {
@@ -40,63 +40,50 @@ export default function TransformPanel({
     };
   }, [previewUrl]);
 
-  const handleVideoUpload = (file: File) => {
+  const handleImageUpload = (file: File) => {
     setUploadStatus('loading');
-
-    // Clear any existing video first
-    clearVideo(false);
+    clearImage(false);
 
     const url = URL.createObjectURL(file);
     setPreviewUrl(url);
 
-    const video = document.createElement('video');
-    video.src = url;
-    video.loop = true;
-    video.muted = true;
-    video.playsInline = true;
+    const img = new Image();
+    img.src = url;
+    img.crossOrigin = 'anonymous';
 
-    video.onloadeddata = () => {
-      video.play().catch(() => {});
+    img.onload = () => {
       setUploadStatus('success');
-      setReferenceVideo(video);
+      setReferenceImage(img);
       setTransformationSettings(prev => ({
         ...prev,
-        referenceVideo: url,
+        referenceImage: url,
       }));
     };
 
-    video.onerror = () => {
+    img.onerror = () => {
       setUploadStatus('error');
       URL.revokeObjectURL(url);
       setPreviewUrl(null);
     };
   };
 
-  const clearVideo = (resetSettings: boolean = true) => {
-    // Stop any playing video
-    if (_referenceVideo) {
-      _referenceVideo.pause();
-      _referenceVideo.src = '';
-    }
-
-    // Revoke URL
+  const clearImage = (resetSettings: boolean = true) => {
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
     }
 
     setPreviewUrl(null);
     setUploadStatus('idle');
-    setReferenceVideo(null);
+    setReferenceImage(null);
 
     if (resetSettings) {
       setTransformationSettings(prev => ({
         ...prev,
-        referenceVideo: null,
+        referenceImage: null,
         enabled: false,
       }));
     }
 
-    // Reset file input
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -108,8 +95,8 @@ export default function TransformPanel({
     setIsDragging(false);
 
     const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith('video/')) {
-      handleVideoUpload(file);
+    if (file && file.type.startsWith('image/')) {
+      handleImageUpload(file);
     }
   };
 
@@ -128,7 +115,7 @@ export default function TransformPanel({
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      handleVideoUpload(file);
+      handleImageUpload(file);
     }
   };
 
@@ -138,7 +125,7 @@ export default function TransformPanel({
 
   const handleClearClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    clearVideo(true);
+    clearImage(true);
   };
 
   const toggleTransformation = () => {
@@ -152,7 +139,7 @@ export default function TransformPanel({
     if (uploadStatus === 'loading') {
       return <Loader size={14} className="animate-spin text-yellow-400" />;
     }
-    if (uploadStatus === 'success' || transformationSettings.referenceVideo) {
+    if (uploadStatus === 'success' || transformationSettings.referenceImage) {
       return <CheckCircle size={14} className="text-green-400" />;
     }
     if (uploadStatus === 'error') {
@@ -183,7 +170,7 @@ export default function TransformPanel({
       <div className="h-full overflow-y-auto p-4">
         <h2 className="text-lg font-semibold text-white mb-2">Transformation Controls</h2>
         <p className="text-xs text-dark-400 mb-4">
-          Upload a reference video to transform. Only visible to you.
+          Upload a clear face photo to transform. Only visible to you.
         </p>
 
         <div className="mb-4 flex items-center gap-2 px-3 py-2 bg-dark-800 rounded-lg border border-dark-700">
@@ -209,10 +196,10 @@ export default function TransformPanel({
         )}
 
         <div className="space-y-6">
-          {/* Video Upload */}
+          {/* Image Upload */}
           <div>
             <label className="text-sm font-medium text-dark-300 block mb-2">
-              Reference Video
+              Reference Face Photo
             </label>
             <div
               className={`relative border-2 border-dashed rounded-lg transition-colors cursor-pointer ${
@@ -226,13 +213,10 @@ export default function TransformPanel({
             >
               {previewUrl ? (
                 <div className="relative p-2">
-                  <video
+                  <img
                     src={previewUrl}
-                    className="w-full h-32 object-cover rounded-lg"
-                    autoPlay
-                    loop
-                    muted
-                    playsInline
+                    alt="Reference face"
+                    className="w-full h-36 object-cover rounded-lg"
                   />
                   {uploadStatus === 'success' && (
                     <div className="absolute top-4 left-4 px-2 py-1 bg-green-500/90 rounded text-xs text-white flex items-center gap-1">
@@ -262,9 +246,9 @@ export default function TransformPanel({
                     </>
                   ) : (
                     <>
-                      <Upload size={24} className="text-dark-400 mb-2" />
-                      <p className="text-sm text-dark-400">Drop video or click</p>
-                      <p className="text-xs text-dark-500 mt-1">MP4, WebM</p>
+                      <Image size={24} className="text-dark-400 mb-2" />
+                      <p className="text-sm text-dark-400">Drop photo or click</p>
+                      <p className="text-xs text-dark-500 mt-1">PNG, JPG</p>
                     </>
                   )}
                 </div>
@@ -272,7 +256,7 @@ export default function TransformPanel({
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="video/*"
+                accept="image/png,image/jpeg,image/jpg"
                 className="hidden"
                 onChange={handleFileSelect}
               />
@@ -319,7 +303,7 @@ export default function TransformPanel({
           </div>
 
           {/* Enable Transformation Button */}
-          {transformationSettings.referenceVideo && (
+          {transformationSettings.referenceImage && (
             <div className="pt-4 border-t border-dark-700">
               <button
                 onClick={toggleTransformation}

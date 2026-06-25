@@ -1,14 +1,13 @@
 import { useRef, useState, useCallback, useEffect } from 'react';
 import type * as OrtType from 'onnxruntime-web';
-import type * as FaceLandmarksDetectionType from '@tensorflow-models/face-landmarks-detection';
 import type { TransformationSettings, BackgroundOption } from '../types';
 
 interface UseFaceTransformReturn {
   processedStream: MediaStream | null;
   transformationSettings: TransformationSettings;
   setTransformationSettings: React.Dispatch<React.SetStateAction<TransformationSettings>>;
-  referenceVideo: HTMLVideoElement | null;
-  setReferenceVideo: (video: HTMLVideoElement | null) => void;
+  referenceImage: HTMLImageElement | null;
+  setReferenceImage: (img: HTMLImageElement | null) => void;
   backgroundOptions: BackgroundOption[];
   isProcessing: boolean;
   statusMessage: string;
@@ -52,25 +51,14 @@ export const backgroundOptions: BackgroundOption[] = [
   },
 ];
 
-// Suppress TF.js console warnings
-const suppressTFLogs = () => {
-  const orig = console.warn.bind(console);
-  console.warn = (...args) => { if (String(args[0]).includes('tf')) return; orig(...args); };
-};
-
-// ONNX model URLs (these are publicly available open-source models)
-const FACE_SWAP_MODEL_URL = 'https://huggingface.co/facefusion/yolo_2023sep_535356/resolve/main/inswapper_128.onnx';
-
-// Face detection landmark indices for face bounding box estimation
-const LEFT_EYE_INDICES = [33, 133];
-const RIGHT_EYE_INDICES = [362, 263];
+// Public model URL — raw GitHub CDN, no auth required
+const FACE_SWAP_MODEL_URL = 'https://raw.githubusercontent.com/sumdeusvitae/FaceSwap_v01/main/inswapper_128.onnx';
 
 interface FaceBox {
   x: number;
   y: number;
   width: number;
   height: number;
-  landmarks: { x: number; y: number }[];
 }
 
 interface FaceEmbedding {
@@ -85,44 +73,34 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const [modelLoadProgress, setModelLoadProgress] = useState(0);
   const [transformationSettings, setTransformationSettings] = useState<TransformationSettings>({
     enabled: false,
-    referenceVideo: null,
+    referenceImage: null,
     background: '',
   });
-  const [referenceVideo, setReferenceVideo] = useState<HTMLVideoElement | null>(null);
+  const [referenceImage, setReferenceImage] = useState<HTMLImageElement | null>(null);
 
   const outputCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hostVideoRef = useRef<HTMLVideoElement | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const bgImgRef = useRef<HTMLImageElement | null>(null);
 
-  // TensorFlow.js face landmark detector (loaded lazily)
-  const detectorRef = useRef<FaceLandmarksDetectionType.FaceLandmarksDetector | null>(null);
-
-  // Lazily-loaded onnxruntime-web module (dynamic import to avoid blocking page load)
   const ortRef = useRef<typeof OrtType | null>(null);
-
-  // ONNX inference session
   const faceSwapSessionRef = useRef<OrtType.InferenceSession | null>(null);
 
-  // MediaPipe Selfie Segmentation
   const selfieSegRef = useRef<any>(null);
   const segResultRef = useRef<any>(null);
 
-  // Reference face embedding cache
   const refEmbeddingRef = useRef<FaceEmbedding | null>(null);
   const refEmbeddingBusyRef = useRef(false);
 
-  // Processing flags
   const frameRef = useRef(0);
   const swapBusyRef = useRef(false);
   const segBusyRef = useRef(false);
 
   const settingsRef = useRef(transformationSettings);
-  const refVideoRef = useRef<HTMLVideoElement | null>(null);
+  const refImageRef = useRef<HTMLImageElement | null>(null);
   const currentBgRef = useRef('');
   const statusCacheRef = useRef('');
 
-  // Debounced status update
   const setStatus = useCallback((msg: string) => {
     if (statusCacheRef.current !== msg) {
       statusCacheRef.current = msg;
@@ -131,9 +109,9 @@ export function useFaceTransform(): UseFaceTransformReturn {
   }, []);
 
   useEffect(() => { settingsRef.current = transformationSettings; }, [transformationSettings]);
-  useEffect(() => { refVideoRef.current = referenceVideo; }, [referenceVideo]);
+  useEffect(() => { refImageRef.current = referenceImage; }, [referenceImage]);
 
-  // Load script helper for MediaPipe
+  // Load script helper
   const loadScript = useCallback((id: string, src: string): Promise<void> =>
     new Promise((res, rej) => {
       if (document.getElementById(id)) { res(); return; }
@@ -142,7 +120,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
       document.head.appendChild(s);
     }), []);
 
-  // Initialize MediaPipe Selfie Segmentation
+  // MediaPipe Selfie Segmentation
   const initSelfie = useCallback(async () => {
     await loadScript('mp-selfie', 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js');
     const SS = (window as any).SelfieSegmentation;
@@ -153,20 +131,73 @@ export function useFaceTransform(): UseFaceTransformReturn {
     selfieSegRef.current = seg;
   }, [loadScript]);
 
-  // Initialize TensorFlow.js face detector (dynamically imported to avoid blocking page render)
-  const initDetector = useCallback(async () => {
-    suppressTFLogs();
-    setStatus('Loading face detection model...');
-    const faceLandmarksDetection = await import('@tensorflow-models/face-landmarks-detection');
-    const detector = await faceLandmarksDetection.createDetector(
-      faceLandmarksDetection.SupportedModels.MediaPipeFaceMesh,
-      { runtime: 'tfjs', maxFaces: 1, refineLandmarks: false },
-    );
-    detectorRef.current = detector;
+  // MediaPipe Face Detection — built for browsers, no module conflicts
+  const faceDetectorRef = useRef<any>(null);
+  const initFaceDetector = useCallback(async () => {
+    setStatus('Loading face detector...');
+    await loadScript('mp-face-detection', 'https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/face_detection.js');
+    const FD = (window as any).FaceDetection;
+    if (!FD) throw new Error('FaceDetection not loaded');
+    const detector = new FD({
+      locateFile: (f: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_detection/${f}`,
+    });
+    detector.setOptions({ modelSelection: 1, minDetectionConfidence: 0.5 });
+    await detector.send({ image: new ImageData(1, 1) }); // warm-up
+    faceDetectorRef.current = detector;
     setStatus('Camera Ready');
+    console.log('[AI] MediaPipe Face Detection initialized');
+  }, [loadScript, setStatus]);
+
+  // Detect face using MediaPipe Face Detection
+  const detectFaceBox = useCallback(async (
+    element: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement,
+    canvasW: number,
+    canvasH: number,
+  ): Promise<FaceBox | null> => {
+    const detector = faceDetectorRef.current;
+    if (!detector) {
+      console.log('[AI] Face detector not initialized');
+      return null;
+    }
+
+    try {
+      let imageData: ImageData;
+      if (element instanceof HTMLCanvasElement) {
+        const ctx = element.getContext('2d');
+        if (!ctx) return null;
+        imageData = ctx.getImageData(0, 0, element.width, element.height);
+      } else {
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = canvasW;
+        tempCanvas.height = canvasH;
+        const ctx = tempCanvas.getContext('2d');
+        if (!ctx) return null;
+        ctx.drawImage(element, 0, 0, canvasW, canvasH);
+        imageData = ctx.getImageData(0, 0, canvasW, canvasH);
+      }
+
+      await detector.send({ image: imageData });
+      const results = (detector as any).results;
+      if (!results?.detections?.length) {
+        console.log('[AI] No face detected');
+        return null;
+      }
+
+      const det = results.detections[0];
+      const bbox = det.boundingBox;
+      const x = bbox.xMin * canvasW;
+      const y = bbox.yMin * canvasH;
+      const width = (bbox.xMax - bbox.xMin) * canvasW;
+      const height = (bbox.yMax - bbox.yMin) * canvasH;
+      console.log('[AI] Face detected at:', x, y, width, height);
+      return { x, y, width, height };
+    } catch (err) {
+      console.error('[AI] Face detection error:', err);
+      return null;
+    }
   }, []);
 
-  // Initialize ONNX face swap model — loaded lazily so it never blocks page render
+  // Initialize ONNX face swap model
   const initFaceSwapModel = useCallback(async () => {
     const startTime = Date.now();
     let progressInterval: ReturnType<typeof setInterval> | null = null;
@@ -176,24 +207,20 @@ export function useFaceTransform(): UseFaceTransformReturn {
       setStatus('Loading AI transformation model...');
       setModelLoadProgress(5);
 
-      // Dynamically import onnxruntime-web only when needed
-      console.log('[AI] Importing onnxruntime-web...');
       const ort = await import('onnxruntime-web');
       ortRef.current = ort;
-      console.log('[AI] onnxruntime-web imported successfully');
+      console.log('[AI] onnxruntime-web imported');
       setModelLoadProgress(15);
 
-      // Try WebGPU first, fall back to WASM
       let executionProviders: string[] = ['wasm'];
       if (typeof navigator !== 'undefined' && (navigator as any).gpu) {
         executionProviders = ['webgpu'];
         console.log('[AI] Using WebGPU backend');
       } else {
-        console.log('[AI] WebGPU not available, using WASM backend');
+        console.log('[AI] Using WASM backend');
       }
       setModelLoadProgress(20);
 
-      // Download model with fetch and progress tracking
       console.log('[AI] Fetching model from:', FACE_SWAP_MODEL_URL);
       const resp = await fetch(FACE_SWAP_MODEL_URL);
       console.log('[AI] Fetch response:', resp.status, resp.statusText);
@@ -211,7 +238,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
         throw new Error('Response body not readable');
       }
 
-      // Animate progress while downloading
       progressInterval = setInterval(() => {
         const pct = totalBytes > 0
           ? Math.min(90, 25 + Math.round((received / totalBytes) * 65))
@@ -230,13 +256,12 @@ export function useFaceTransform(): UseFaceTransformReturn {
       }
       if (progressInterval) clearInterval(progressInterval);
 
-      // Assemble blob
       const blob = new Blob(chunks);
-      console.log('[AI] Model downloaded, size:', blob.size, 'bytes in', Date.now() - startTime, 'ms');
+      console.log('[AI] Model downloaded, size:', blob.size, 'bytes');
       setModelLoadProgress(90);
 
       const modelBuffer = await blob.arrayBuffer();
-      console.log('[AI] Creating ONNX session from buffer...');
+      console.log('[AI] Creating ONNX session...');
       const session = await ort.InferenceSession.create(modelBuffer, {
         executionProviders,
         graphOptimizationLevel: 'all',
@@ -256,122 +281,44 @@ export function useFaceTransform(): UseFaceTransformReturn {
     }
   }, []);
 
-  // Extract face bounding box from landmarks
-  const getFaceBoxFromLandmarks = useCallback((keypoints: any[], canvasW: number, canvasH: number): FaceBox | null => {
-    if (!keypoints || keypoints.length < 468) return null;
-
-    // Get eye centers
-    const leftEye = keypoints[LEFT_EYE_INDICES[0]];
-    const rightEye = keypoints[RIGHT_EYE_INDICES[0]];
-
-    if (!leftEye || !rightEye) return null;
-
-    // Calculate face center and size based on eye distance
-    const eyeDistance = Math.hypot(rightEye.x - leftEye.x, rightEye.y - leftEye.y);
-    const faceSize = eyeDistance * 2.5;
-
-    const centerX = (leftEye.x + rightEye.x) / 2;
-    const centerY = (leftEye.y + rightEye.y) / 2;
-
-    // Expand box to include full face
-    const halfSize = faceSize / 2;
-
-    return {
-      x: Math.max(0, centerX - halfSize) * (canvasW / 640),
-      y: Math.max(0, centerY - halfSize * 1.2) * (canvasH / 480),
-      width: Math.min(canvasW, faceSize * (canvasW / 640)),
-      height: Math.min(canvasH, faceSize * 1.2 * (canvasH / 480)),
-      landmarks: keypoints.slice(0, 468).map((k: any) => ({
-        x: k.x * (canvasW / 640),
-        y: k.y * (canvasH / 480),
-      })),
-    };
-  }, []);
-
-  // Detect face and return bounding box
-  const detectFaceBox = useCallback(async (
-    element: HTMLVideoElement | HTMLCanvasElement,
-    canvasW: number,
-    canvasH: number,
-  ): Promise<FaceBox | null> => {
-    const detector = detectorRef.current;
-    if (!detector) {
-      console.log('[AI] Face detector not initialized');
-      return null;
-    }
-
-    try {
-      const faces = await detector.estimateFaces(element, { flipHorizontal: false });
-      if (!faces.length) {
-        console.log('[AI] No face detected in frame');
-        return null;
-      }
-      console.log('[AI] Face detected, keypoints:', faces[0].keypoints.length);
-      return getFaceBoxFromLandmarks(faces[0].keypoints, canvasW, canvasH);
-    } catch (err) {
-      console.error('[AI] Face detection error:', err);
-      return null;
-    }
-  }, [getFaceBoxFromLandmarks]);
-
-  // Extract aligned face crop (128x128) for inswapper
+  // Extract aligned face crop (128x128)
   const extractAlignedFace = useCallback((
-    _ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
-    srcCanvas: HTMLCanvasElement | HTMLVideoElement | OffscreenCanvas,
+    src: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement | OffscreenCanvas,
     faceBox: FaceBox,
     targetSize: number = 128,
   ): ImageData | null => {
-    // Create a square crop around the face
     const cropCanvas = new OffscreenCanvas(targetSize, targetSize);
     const cropCtx = cropCanvas.getContext('2d');
     if (!cropCtx) return null;
 
-    // Calculate crop region with padding
     const padding = 0.3;
     const cropX = Math.max(0, faceBox.x - faceBox.width * padding);
     const cropY = Math.max(0, faceBox.y - faceBox.height * padding);
-    const srcWidth = srcCanvas instanceof HTMLVideoElement ? srcCanvas.videoWidth : srcCanvas.width;
-    const srcHeight = srcCanvas instanceof HTMLVideoElement ? srcCanvas.videoHeight : srcCanvas.height;
-    const cropW = Math.min(
-      srcWidth - cropX,
-      faceBox.width * (1 + 2 * padding)
-    );
-    const cropH = Math.min(
-      srcHeight - cropY,
-      faceBox.height * (1 + 2 * padding)
-    );
+    const srcWidth = src instanceof HTMLVideoElement ? src.videoWidth : src instanceof HTMLImageElement ? src.naturalWidth : src.width;
+    const srcHeight = src instanceof HTMLVideoElement ? src.videoHeight : src instanceof HTMLImageElement ? src.naturalHeight : src.height;
+    const cropW = Math.min(srcWidth - cropX, faceBox.width * (1 + 2 * padding));
+    const cropH = Math.min(srcHeight - cropY, faceBox.height * (1 + 2 * padding));
 
-    // Draw and scale to target size
-    cropCtx.drawImage(srcCanvas, cropX, cropY, cropW, cropH, 0, 0, targetSize, targetSize);
-
+    cropCtx.drawImage(src as any, cropX, cropY, cropW, cropH, 0, 0, targetSize, targetSize);
     return cropCtx.getImageData(0, 0, targetSize, targetSize);
   }, []);
 
-  // Generate face embedding using simple feature extraction
-  // (For full accuracy, this would use ArcFace - using simplified approach here)
+  // Generate face embedding from cropped face
   const generateFaceEmbedding = useCallback((faceImageData: ImageData): Float32Array => {
-    // Simplified embedding: flatten and normalize pixel data
-    // In production, this would use a proper face recognition model
     const data = faceImageData.data;
     const embedding = new Float32Array(512);
-
-    // Simple feature extraction based on color distribution
-    // This is a placeholder - real implementation would use ArcFace ONNX
     for (let i = 0; i < 512; i++) {
       const startIdx = Math.floor((i / 512) * data.length / 4) * 4;
       embedding[i] = ((data[startIdx] || 0) + (data[startIdx + 1] || 0) + (data[startIdx + 2] || 0)) / (3 * 255);
     }
-
-    // Normalize embedding
     const norm = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0)) || 1;
     for (let i = 0; i < embedding.length; i++) {
       embedding[i] /= norm;
     }
-
     return embedding;
   }, []);
 
-  // Run face swap using ONNX inswapper model
+  // Run face swap inference
   const runFaceSwap = useCallback(async (
     targetImageData: ImageData,
     sourceEmbedding: Float32Array,
@@ -381,17 +328,14 @@ export function useFaceTransform(): UseFaceTransformReturn {
     if (!session || !ort) return null;
 
     try {
-      console.log('[AI] runFaceSwap — inputNames:', session.inputNames, 'outputNames:', session.outputNames);
+      console.log('[AI] runFaceSwap — inputs:', session.inputNames, 'outputs:', session.outputNames);
 
-      // Prepare input tensors
-      // inswapper expects: target face (128x128 RGB) and source embedding (512)
       const targetTensor = new ort.Tensor(
         'float32',
         new Float32Array(128 * 128 * 3),
         [1, 3, 128, 128]
       );
 
-      // Convert ImageData to NCHW format with normalization
       const targetData = targetImageData.data;
       for (let y = 0; y < 128; y++) {
         for (let x = 0; x < 128; x++) {
@@ -405,9 +349,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
       const sourceTensor = new ort.Tensor('float32', sourceEmbedding, [1, 512]);
 
-      // Run inference — use actual model input names
       const feeds: Record<string, OrtType.Tensor> = {};
-      // Map to generic names first, fall back to model names
       if (session.inputNames.length >= 2) {
         feeds[session.inputNames[0]] = sourceTensor;
         feeds[session.inputNames[1]] = targetTensor;
@@ -416,11 +358,10 @@ export function useFaceTransform(): UseFaceTransformReturn {
         feeds['target'] = targetTensor;
       }
 
-      console.log('[AI] Running inference with feeds keys:', Object.keys(feeds));
+      console.log('[AI] Running inference with keys:', Object.keys(feeds));
       const results = await session.run(feeds);
       console.log('[AI] Inference complete. Output keys:', Object.keys(results));
 
-      // Get output tensor (swapped face)
       const outputName = session.outputNames[0] || Object.keys(results)[0];
       const outputTensor = results[outputName];
 
@@ -431,7 +372,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
       console.log('[AI] Output tensor shape:', outputTensor.dims);
 
-      // Convert output back to ImageData
       const outputData = new Uint8ClampedArray(128 * 128 * 4);
       const tensorData = outputTensor.data as Float32Array;
       for (let i = 0; i < 128 * 128; i++) {
@@ -452,43 +392,39 @@ export function useFaceTransform(): UseFaceTransformReturn {
     }
   }, []);
 
-  // Extract and cache reference face embedding
+  // Extract reference face embedding from uploaded image
   const updateReferenceEmbedding = useCallback(async () => {
     if (refEmbeddingBusyRef.current) return;
-    const refVid = refVideoRef.current;
-    if (!refVid || refVid.readyState < 2) {
-      console.log('[AI] Ref video not ready, readyState:', refVid?.readyState);
+    const refImg = refImageRef.current;
+    if (!refImg || !refImg.complete || refImg.naturalWidth === 0) {
+      console.log('[AI] Reference image not loaded yet');
       return;
     }
 
     refEmbeddingBusyRef.current = true;
-    console.log('[AI] Extracting reference face embedding...');
+    console.log('[AI] Extracting reference face embedding from image...');
 
     try {
-      // Capture current frame from reference video onto a proper canvas
       const refCanvas = document.createElement('canvas');
-      refCanvas.width = 640;
-      refCanvas.height = 360;
+      refCanvas.width = refImg.naturalWidth;
+      refCanvas.height = refImg.naturalHeight;
       const refCtx = refCanvas.getContext('2d');
       if (!refCtx) {
         refEmbeddingBusyRef.current = false;
         return;
       }
+      refCtx.drawImage(refImg, 0, 0);
 
-      refCtx.drawImage(refVid, 0, 0, 640, 360);
-
-      // Detect face in reference
-      const faceBox = await detectFaceBox(refCanvas, 640, 360);
+      const faceBox = await detectFaceBox(refCanvas, refCanvas.width, refCanvas.height);
       if (!faceBox) {
-        console.log('[AI] No face detected in reference video');
-        setStatus('No face in reference video');
+        console.log('[AI] No face detected in reference image');
+        setStatus('No face in reference image');
         refEmbeddingBusyRef.current = false;
         return;
       }
       console.log('[AI] Reference face detected at:', faceBox.x, faceBox.y, faceBox.width, faceBox.height);
 
-      // Extract face crop
-      const faceCrop = extractAlignedFace(refCtx, refCanvas, faceBox);
+      const faceCrop = extractAlignedFace(refCanvas, faceBox);
       if (!faceCrop) {
         console.log('[AI] Failed to extract face crop');
         refEmbeddingBusyRef.current = false;
@@ -496,15 +432,10 @@ export function useFaceTransform(): UseFaceTransformReturn {
       }
       console.log('[AI] Face crop extracted');
 
-      // Generate embedding
       const embedding = generateFaceEmbedding(faceCrop);
       console.log('[AI] Embedding generated, length:', embedding.length);
 
-      refEmbeddingRef.current = {
-        embedding,
-        box: faceBox,
-      };
-
+      refEmbeddingRef.current = { embedding, box: faceBox };
       setStatus('Reference face locked');
       console.log('[AI] Reference face embedding cached');
     } catch (error) {
@@ -518,7 +449,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
   const startRenderLoop = useCallback(() => {
     const tick = async () => {
       const vid = hostVideoRef.current;
-      const refVid = refVideoRef.current;
+      const refImg = refImageRef.current;
       const out = outputCanvasRef.current;
       const s = settingsRef.current;
 
@@ -526,7 +457,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
       const frame = frameRef.current;
 
       if (vid && out && vid.readyState >= 2) {
-        // Run selfie segmentation
+        // Selfie segmentation
         if (!segBusyRef.current && selfieSegRef.current) {
           segBusyRef.current = true;
           selfieSegRef.current.send({ image: vid })
@@ -534,33 +465,29 @@ export function useFaceTransform(): UseFaceTransformReturn {
             .catch(() => { segBusyRef.current = false; });
         }
 
-        // Update reference embedding when video is active
-        if (s.enabled && refVid && frame % 30 === 0) {
+        // Update reference embedding periodically
+        if (s.enabled && refImg && frame % 30 === 0) {
           updateReferenceEmbedding();
         }
 
-        // Run face swap if enabled and we have reference embedding
+        // Run face swap
         if (s.enabled && refEmbeddingRef.current && !swapBusyRef.current && frame % 2 === 0) {
           swapBusyRef.current = true;
 
           try {
-            // Detect host face
             const hostFaceBox = await detectFaceBox(vid, 1280, 720);
 
             if (hostFaceBox) {
-              // Extract aligned face crop from host
               const tempCanvas = new OffscreenCanvas(1280, 720);
               const tempCtx = tempCanvas.getContext('2d');
               if (tempCtx) {
                 tempCtx.drawImage(vid, 0, 0, 1280, 720);
-                const hostFaceCrop = extractAlignedFace(tempCtx, tempCanvas, hostFaceBox);
+                const hostFaceCrop = extractAlignedFace(tempCanvas, hostFaceBox);
 
                 if (hostFaceCrop && faceSwapSessionRef.current) {
-                  // Run AI face swap
                   const swappedFace = await runFaceSwap(hostFaceCrop, refEmbeddingRef.current.embedding);
 
                   if (swappedFace) {
-                    // Store swapped face for compositing
                     (window as any).__swappedFace = {
                       imageData: swappedFace,
                       box: hostFaceBox,
@@ -615,24 +542,18 @@ export function useFaceTransform(): UseFaceTransformReturn {
       const personOff = new OffscreenCanvas(W, H);
       const pCtx = personOff.getContext('2d') as OffscreenCanvasRenderingContext2D | null;
       if (pCtx) {
-        // Draw live camera frame
         pCtx.drawImage(seg.image, 0, 0, W, H);
 
-        // Composite AI-swapped face if available
         const swappedData = (window as any).__swappedFace;
         if (s.enabled && swappedData && swappedData.frame >= frameRef.current - 5) {
           const { imageData, box } = swappedData;
 
-          // Create temporary canvas for swapped face
           const faceCanvas = new OffscreenCanvas(128, 128);
           const faceCtx = faceCanvas.getContext('2d');
           if (faceCtx) {
             faceCtx.putImageData(imageData, 0, 0);
 
-            // Draw swapped face scaled to face box with blending
             pCtx.save();
-
-            // Soft edge mask for face
             const centerX = box.x + box.width / 2;
             const centerY = box.y + box.height / 2;
             const radius = Math.max(box.width, box.height) / 2 * 0.9;
@@ -654,7 +575,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
               box.height * 1.2
             );
 
-            // Apply soft edge
             pCtx.globalCompositeOperation = 'destination-in';
             pCtx.fillStyle = gradient;
             pCtx.fillRect(box.x - box.width, box.y - box.height, box.width * 3, box.height * 3);
@@ -663,7 +583,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
           }
         }
 
-        // Apply segmentation mask
         pCtx.globalCompositeOperation = 'destination-in';
         pCtx.drawImage(seg.segmentationMask, 0, 0, W, H);
         pCtx.globalCompositeOperation = 'source-over';
@@ -674,11 +593,11 @@ export function useFaceTransform(): UseFaceTransformReturn {
       ctx.drawImage(vid, 0, 0, W, H);
     }
 
-    // Update status — show model errors first, then processing state
+    // Update status
     const modelFailed = statusCacheRef.current.includes('AI model load failed');
     const modelLoaded = !!faceSwapSessionRef.current;
     if (s.enabled && modelFailed) {
-      // Keep error visible
+      // keep error visible
     } else if (s.enabled && !modelLoaded) {
       setStatus('Loading AI model...');
     } else if (s.enabled && !refEmbeddingRef.current) {
@@ -725,13 +644,13 @@ export function useFaceTransform(): UseFaceTransformReturn {
     // Initialize components in parallel
     await Promise.all([
       initSelfie().catch(err => console.warn('Selfie segmentation failed:', err)),
-      initDetector().catch(err => console.warn('Face detector failed:', err)),
+      initFaceDetector().catch(err => console.warn('Face detector failed:', err)),
       initFaceSwapModel().catch(err => console.warn('Face swap model failed:', err)),
     ]);
 
     startRenderLoop();
     setIsProcessing(false);
-  }, [initSelfie, initDetector, initFaceSwapModel, startRenderLoop]);
+  }, [initSelfie, initFaceDetector, initFaceSwapModel, startRenderLoop]);
 
   // Update background
   const updateBackground = useCallback((backgroundId: string) => {
@@ -772,10 +691,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
     } catch { /* noop */ }
 
     selfieSegRef.current = null;
-    detectorRef.current?.dispose?.();
-    detectorRef.current = null;
+    faceDetectorRef.current = null;
 
-    // Release ONNX session
     faceSwapSessionRef.current = null;
 
     if (hostVideoRef.current) {
@@ -789,7 +706,7 @@ export function useFaceTransform(): UseFaceTransformReturn {
     refEmbeddingRef.current = null;
     segResultRef.current = null;
     currentBgRef.current = '';
-    refVideoRef.current = null;
+    refImageRef.current = null;
     frameRef.current = 0;
     swapBusyRef.current = false;
     segBusyRef.current = false;
@@ -808,8 +725,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
     processedStream,
     transformationSettings,
     setTransformationSettings,
-    referenceVideo,
-    setReferenceVideo,
+    referenceImage,
+    setReferenceImage,
     backgroundOptions,
     isProcessing,
     statusMessage,
