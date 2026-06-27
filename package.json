@@ -13,17 +13,10 @@
     "typecheck": "tsc --noEmit -p tsconfig.app.json"
   },
   "dependencies": {
-    "@mediapipe/face_mesh": "^0.4.1633559619",
     "@mediapipe/selfie_segmentation": "^0.1.1675465747",
-    "@tensorflow-models/face-landmarks-detection": "^1.0.6",
-    "@tensorflow/tfjs": "^4.22.0",
-    "@tensorflow/tfjs-node": "^4.22.0",
-    "@vladmandic/face-api": "^1.7.15",
-    "canvas": "^3.2.3",
     "express": "^4.21.0",
     "lucide-react": "^0.344.0",
     "multer": "^2.2.0",
-    "onnxjs": "^0.1.8",
     "onnxruntime-node": "^1.16.3",
     "onnxruntime-web": "^1.21.0",
     "protobufjs": "^8.6.5",

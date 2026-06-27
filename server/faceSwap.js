@@ -1,9 +1,22 @@
-import { createCanvas, createImageData, loadImage } from 'canvas';
+/**
+ * Server-side AI face transformation engine.
+ *
+ * Pipeline:
+ *   SCRFD (det_10g.onnx)    — face detection + 5-point keypoints
+ *   ArcFace (w600k_r50.onnx) — 512-dim identity embedding from reference photo
+ *   InSwapper (inswapper_128.onnx) — neural face synthesis using identity latent
+ *   sharp                   — JPEG encode/decode, resize (no native canvas needed)
+ *
+ * All ONNX inference via onnxruntime-node (prebuilt binaries, no C++ build).
+ * All image I/O via sharp (prebuilt binaries, no C++ build).
+ */
+
+import sharp from 'sharp';
 import { InferenceSession, Tensor } from 'onnxruntime-node';
-import { createWriteStream, existsSync, mkdirSync, statSync } from 'fs';
+import { existsSync, mkdirSync, statSync, createWriteStream } from 'fs';
+import { readFile } from 'fs/promises';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { pipeline } from 'stream/promises';
 import https from 'https';
 import http from 'http';
 
@@ -14,59 +27,59 @@ const MODELS_DIR = join(__dirname, 'models');
 if (!existsSync(MODELS_DIR)) mkdirSync(MODELS_DIR, { recursive: true });
 
 const MODEL_URLS = {
-  det: 'https://huggingface.co/Aitrepreneur/insightface/resolve/main/models/buffalo_l/det_10g.onnx',
+  det:     'https://huggingface.co/Aitrepreneur/insightface/resolve/main/models/buffalo_l/det_10g.onnx',
   arcface: 'https://huggingface.co/Aitrepreneur/insightface/resolve/main/models/buffalo_l/w600k_r50.onnx',
   swapper: 'https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx',
 };
 
 const MODEL_PATHS = {
-  det: join(MODELS_DIR, 'det_10g.onnx'),
+  det:     join(MODELS_DIR, 'det_10g.onnx'),
   arcface: join(MODELS_DIR, 'w600k_r50.onnx'),
   swapper: join(MODELS_DIR, 'inswapper_128.onnx'),
 };
 
-const MODEL_SIZES = {
-  det: 16_900_000,      // ~16MB
-  arcface: 166_000_000, // ~166MB
-  swapper: 554_000_000, // ~554MB
+// Minimum valid sizes (90% of real size as guard)
+const MODEL_MIN_SIZES = {
+  det:     15_000_000,
+  arcface: 149_000_000,
+  swapper: 498_000_000,
 };
 
-let sessions = { det: null, arcface: null, swapper: null };
-let swapperEmap = null; // internal embedding map from inswapper ONNX
-let initState = 'idle'; // idle | downloading | loading | ready | error
-let initError = null;
+let sessions   = { det: null, arcface: null, swapper: null };
+let swapperEmap = null;
+let initState  = 'idle';
+let initError  = null;
 let downloadProgress = {};
 
 export function getInitState() {
-  return { state: initState, error: initError, progress: downloadProgress };
+  return { state: initState, error: initError, progress: { ...downloadProgress } };
 }
 
-// Follow redirects and stream to file
+// ─── HTTP download with redirect following ───────────────────────────────────
 function downloadFile(url, dest, label) {
   return new Promise((resolve, reject) => {
     const attempt = (u) => {
       const mod = u.startsWith('https') ? https : http;
       const req = mod.get(u, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-        if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307) {
+        if ([301, 302, 307, 308].includes(res.statusCode)) {
           return attempt(res.headers.location);
         }
         if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode} for ${label}`));
+          return reject(new Error(`HTTP ${res.statusCode} downloading ${label}`));
         }
         const total = parseInt(res.headers['content-length'] || '0', 10);
         let received = 0;
         const ws = createWriteStream(dest);
         res.on('data', (chunk) => {
           received += chunk.length;
-          if (total > 0) {
-            downloadProgress[label] = Math.round((received / total) * 100);
-          }
+          if (total > 0) downloadProgress[label] = Math.round((received / total) * 100);
         });
         res.pipe(ws);
         ws.on('finish', () => { downloadProgress[label] = 100; resolve(); });
         ws.on('error', reject);
       });
       req.on('error', reject);
+      req.setTimeout(60000, () => { req.destroy(); reject(new Error(`Timeout downloading ${label}`)); });
     };
     attempt(url);
   });
@@ -74,167 +87,194 @@ function downloadFile(url, dest, label) {
 
 async function ensureModel(key) {
   const path = MODEL_PATHS[key];
-  if (existsSync(path)) {
-    const stat = statSync(path);
-    if (stat.size > MODEL_SIZES[key] * 0.9) {
-      console.log(`[FaceSwap] Model ${key} already cached (${(stat.size / 1e6).toFixed(1)}MB)`);
-      downloadProgress[key] = 100;
-      return;
-    }
-    console.log(`[FaceSwap] Cached ${key} looks incomplete (${stat.size} bytes), re-downloading`);
+  if (existsSync(path) && statSync(path).size >= MODEL_MIN_SIZES[key]) {
+    downloadProgress[key] = 100;
+    console.log(`[FaceSwap] ${key} already cached`);
+    return;
   }
-  console.log(`[FaceSwap] Downloading ${key} from HuggingFace...`);
+  console.log(`[FaceSwap] Downloading ${key}...`);
   downloadProgress[key] = 0;
   await downloadFile(MODEL_URLS[key], path, key);
-  console.log(`[FaceSwap] Downloaded ${key}`);
+  console.log(`[FaceSwap] ${key} downloaded`);
 }
 
-// ArcFace reference landmarks for 112x112 crop
-const ARCFACE_DST = Float32Array.from([
+// ─── Image helpers via sharp (no canvas, no native build required) ────────────
+
+/**
+ * Decode any image buffer (JPEG/PNG/etc.) to raw RGBA pixels.
+ * Returns { data: Uint8Array, width, height }
+ */
+async function decodeToRGBA(buffer) {
+  const { data, info } = await sharp(buffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  return { data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), width: info.width, height: info.height };
+}
+
+/**
+ * Resize RGBA pixel array to newW×newH using sharp.
+ * Input and output are flat Uint8Array RGBA.
+ */
+async function resizeRGBA(pixels, srcW, srcH, newW, newH) {
+  const buf = await sharp(Buffer.from(pixels), { raw: { width: srcW, height: srcH, channels: 4 } })
+    .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+    .raw()
+    .toBuffer();
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+
+/**
+ * Encode RGBA pixel array to JPEG buffer.
+ */
+async function encodeToJPEG(pixels, width, height, quality = 85) {
+  return sharp(Buffer.from(pixels), { raw: { width, height, channels: 4 } })
+    .jpeg({ quality })
+    .toBuffer();
+}
+
+// ─── Geometry helpers ─────────────────────────────────────────────────────────
+
+// ArcFace canonical 5-point landmarks for 112×112 crop
+const ARCFACE_DST = [
   38.2946, 51.6963,
   73.5318, 51.5014,
   56.0252, 71.7366,
   41.5493, 92.3655,
   70.7299, 92.2041,
-]);
+];
 
-// Compute similarity transform M (2x3) that maps src 5 pts → ARCFACE_DST
-// Returns flat [a, b, tx, c, d, ty]
+/**
+ * Estimate 2×3 similarity transform M mapping srcKps (flat [x0,y0,x1,y1,...]) → ARCFACE_DST.
+ * Returns [a, b, tx, c, d, ty].
+ */
 function estimateNorm(srcKps, imageSize = 112) {
-  // Destination is ARCFACE_DST scaled for imageSize
   const ratio = imageSize / 112.0;
-  const dx = imageSize % 128 === 0 ? 8.0 * ratio : 0;
-  const dst = new Float64Array(10);
-  for (let i = 0; i < 5; i++) {
-    dst[i * 2]     = ARCFACE_DST[i * 2]     * ratio + dx;
-    dst[i * 2 + 1] = ARCFACE_DST[i * 2 + 1] * ratio;
-  }
+  const dx    = imageSize % 128 === 0 ? 8.0 * ratio : 0;
+  const dstX  = ARCFACE_DST.filter((_, i) => i % 2 === 0).map(v => v * ratio + dx);
+  const dstY  = ARCFACE_DST.filter((_, i) => i % 2 !== 0).map(v => v * ratio);
 
-  // src and dst are arrays of 5 [x,y] pairs
-  // Similarity transform: dst = M * [src; 1]
-  // Solve least-squares 2x3 using 5 correspondence points
-  // Build design matrix A (10x4) and target b (10x1) for [a, b, tx, c, d, ty]
-  // Using the Umeyama method for similarity transform
+  const srcX = srcKps.filter((_, i) => i % 2 === 0);
+  const srcY = srcKps.filter((_, i) => i % 2 !== 0);
+  const N = 5;
 
-  // Mean src and dst
-  let sxMean = 0, syMean = 0, dxMean = 0, dyMean = 0;
-  for (let i = 0; i < 5; i++) {
-    sxMean += srcKps[i * 2]; syMean += srcKps[i * 2 + 1];
-    dxMean += dst[i * 2];    dyMean += dst[i * 2 + 1];
-  }
-  sxMean /= 5; syMean /= 5; dxMean /= 5; dyMean /= 5;
+  const smx = srcX.reduce((a, v) => a + v, 0) / N;
+  const smy = srcY.reduce((a, v) => a + v, 0) / N;
+  const dmx = dstX.reduce((a, v) => a + v, 0) / N;
+  const dmy = dstY.reduce((a, v) => a + v, 0) / N;
 
-  let ss = 0, sxy = 0;
-  for (let i = 0; i < 5; i++) {
-    const sx = srcKps[i * 2] - sxMean, sy = srcKps[i * 2 + 1] - syMean;
-    const dx2 = dst[i * 2] - dxMean, dy2 = dst[i * 2 + 1] - dyMean;
-    ss += sx * sx + sy * sy;
+  let ss = 0, sxy = 0, syx = 0;
+  for (let i = 0; i < N; i++) {
+    const sx = srcX[i] - smx, sy = srcY[i] - smy;
+    const dx2 = dstX[i] - dmx, dy2 = dstY[i] - dmy;
+    ss  += sx * sx + sy * sy;
     sxy += sx * dx2 + sy * dy2;
-  }
-  let syx = 0;
-  for (let i = 0; i < 5; i++) {
-    const sx = srcKps[i * 2] - sxMean, sy = srcKps[i * 2 + 1] - syMean;
-    const dy2 = dst[i * 2 + 1] - dyMean;
-    const dx2 = dst[i * 2] - dxMean;
     syx += sx * dy2 - sy * dx2;
   }
 
-  const scale = ss > 0 ? Math.sqrt(sxy * sxy + syx * syx) / ss : 1;
-  const cos_a = sxy / (ss * scale + 1e-10);
-  const sin_a = syx / (ss * scale + 1e-10);
-
-  const a = scale * cos_a;
-  const b = -scale * sin_a;
-  const tx = dxMean - a * sxMean - b * syMean;
-  const c = scale * sin_a;
-  const d = scale * cos_a;
-  const ty = dyMean - c * sxMean - d * syMean;
+  const a  =  sxy / (ss + 1e-10);
+  const b  = -syx / (ss + 1e-10);
+  const tx =  dmx - a * smx - b * smy;
+  const c  =  syx / (ss + 1e-10);
+  const d  =  sxy / (ss + 1e-10);
+  const ty =  dmy - c * smx - d * smy;
 
   return [a, b, tx, c, d, ty];
 }
 
-// Warp image using 2x3 affine matrix, output is size x size RGBA pixel array
-function warpAffine(pixelData, srcW, srcH, M, outSize) {
-  // Invert M (2x3 affine) → M_inv
-  const [a, b, tx, c, d, ty] = M;
-  const det = a * d - b * c;
-  if (Math.abs(det) < 1e-10) return new Uint8ClampedArray(outSize * outSize * 4);
-  const ia = d / det, ib = -b / det, ic = -c / det, id = a / det;
-  const itx = (b * ty - d * tx) / det;
-  const ity = (c * tx - a * ty) / det;
-
-  const out = new Uint8ClampedArray(outSize * outSize * 4);
-  for (let y = 0; y < outSize; y++) {
-    for (let x = 0; x < outSize; x++) {
-      // Map output pixel back to source
-      const sx = ia * x + ib * y + itx;
-      const sy = ic * x + id * y + ity;
-      const ix = Math.round(sx), iy = Math.round(sy);
-      const di = (y * outSize + x) * 4;
-      if (ix >= 0 && ix < srcW && iy >= 0 && iy < srcH) {
-        const si = (iy * srcW + ix) * 4;
-        out[di]     = pixelData[si];
-        out[di + 1] = pixelData[si + 1];
-        out[di + 2] = pixelData[si + 2];
-        out[di + 3] = 255;
-      }
-    }
-  }
-  return out;
-}
-
-// Warp using inverse matrix (forward warp)
-function warpAffineInverse(pixelData, srcW, srcH, M_inv, outW, outH) {
-  const [a, b, tx, c, d, ty] = M_inv;
-  const out = new Uint8ClampedArray(outW * outH * 4);
-  for (let y = 0; y < outH; y++) {
-    for (let x = 0; x < outW; x++) {
-      const sx = Math.round(a * x + b * y + tx);
-      const sy = Math.round(c * x + d * y + ty);
-      const di = (y * outW + x) * 4;
-      if (sx >= 0 && sx < srcW && sy >= 0 && sy < srcH) {
-        const si = (sy * srcW + sx) * 4;
-        out[di]     = pixelData[si];
-        out[di + 1] = pixelData[si + 1];
-        out[di + 2] = pixelData[si + 2];
-        out[di + 3] = 255;
-      }
-    }
-  }
-  return out;
-}
-
-// Invert 2x3 affine transform
-function invertAffine(M) {
-  const [a, b, tx, c, d, ty] = M;
+/** Invert 2×3 affine [a,b,tx,c,d,ty]. */
+function invertAffine([a, b, tx, c, d, ty]) {
   const det = a * d - b * c;
   if (Math.abs(det) < 1e-10) return [1, 0, 0, 0, 1, 0];
-  const ia = d / det, ib = -b / det, ic = -c / det, id2 = a / det;
-  return [ia, ib, (b * ty - d * tx) / det, ic, id2, (c * tx - a * ty) / det];
+  const ia = d / det, ib = -b / det;
+  const ic = -c / det, id = a / det;
+  return [ia, ib, (b * ty - d * tx) / det, ic, id, (c * tx - a * ty) / det];
 }
 
-// Convert RGBA pixel array (W x H) to CHW float32 blob for ONNX
-// normalize = 'arcface': (x - 127.5) / 128, channels: RGB
-// normalize = 'swapper': x / 255, channels: RGB (NCHW)
-function pixelsToBlob(pixels, w, h, normalize) {
+/**
+ * Warp RGBA pixel array by 2×3 affine (inverse mapping).
+ * Output pixel at (x,y) is sampled from source at M_inv * [x,y,1].
+ */
+function warpAffine(pixels, srcW, srcH, M, outSize) {
+  const [a, b, tx, c, d, ty] = M;
+  const det = a * d - b * c;
+  const out = new Uint8ClampedArray(outSize * outSize * 4);
+
+  // Inverse of M
+  let ia, ib, itx, ic, id2, ity;
+  if (Math.abs(det) < 1e-10) {
+    ia = 1; ib = 0; itx = 0; ic = 0; id2 = 1; ity = 0;
+  } else {
+    ia = d / det; ib = -b / det; itx = (b * ty - d * tx) / det;
+    ic = -c / det; id2 = a / det; ity = (c * tx - a * ty) / det;
+  }
+
+  for (let y = 0; y < outSize; y++) {
+    for (let x = 0; x < outSize; x++) {
+      const sx = Math.round(ia * x + ib * y + itx);
+      const sy = Math.round(ic * x + id2 * y + ity);
+      const di = (y * outSize + x) * 4;
+      if (sx >= 0 && sx < srcW && sy >= 0 && sy < srcH) {
+        const si = (sy * srcW + sx) * 4;
+        out[di]     = pixels[si];
+        out[di + 1] = pixels[si + 1];
+        out[di + 2] = pixels[si + 2];
+        out[di + 3] = 255;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Warp outW×outH target image using forward M (paint fake face back).
+ * Equivalent to cv2.warpAffine with M_inv.
+ */
+function warpAffineBack(pixels, srcW, srcH, M_inv, outW, outH) {
+  const [a, b, tx, c, d, ty] = M_inv;
+  const out = new Uint8ClampedArray(outW * outH * 4);
+  for (let y = 0; y < srcH; y++) {
+    for (let x = 0; x < srcW; x++) {
+      const dx = Math.round(a * x + b * y + tx);
+      const dy = Math.round(c * x + d * y + ty);
+      if (dx >= 0 && dx < outW && dy >= 0 && dy < outH) {
+        const si = (y * srcW + x) * 4;
+        const di = (dy * outW + dx) * 4;
+        out[di]     = pixels[si];
+        out[di + 1] = pixels[si + 1];
+        out[di + 2] = pixels[si + 2];
+        out[di + 3] = 255;
+      }
+    }
+  }
+  return out;
+}
+
+// ─── ONNX helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Convert RGBA pixel array to CHW float32 blob.
+ * norm='arcface': (v-127.5)/128  norm='swapper': v/255
+ */
+function pixelsToBlob(pixels, w, h, norm) {
   const n = w * h;
   const blob = new Float32Array(3 * n);
   for (let i = 0; i < n; i++) {
     const r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
-    if (normalize === 'arcface') {
-      blob[i]         = (r - 127.5) / 128.0;
-      blob[n + i]     = (g - 127.5) / 128.0;
-      blob[2 * n + i] = (b - 127.5) / 128.0;
+    if (norm === 'arcface') {
+      blob[i]         = (r - 127.5) / 128;
+      blob[n + i]     = (g - 127.5) / 128;
+      blob[2 * n + i] = (b - 127.5) / 128;
     } else {
-      blob[i]         = r / 255.0;
-      blob[n + i]     = g / 255.0;
-      blob[2 * n + i] = b / 255.0;
+      blob[i]         = r / 255;
+      blob[n + i]     = g / 255;
+      blob[2 * n + i] = b / 255;
     }
   }
   return blob;
 }
 
-// 3xHxW float32 predictions → RGBA pixels
+/** Convert CHW float32 prediction [0,1] → RGBA Uint8ClampedArray. */
 function predToPixels(pred, size) {
   const n = size * size;
   const out = new Uint8ClampedArray(n * 4);
@@ -247,209 +287,151 @@ function predToPixels(pred, size) {
   return out;
 }
 
-// Simple Gaussian blur on single-channel Float32Array
-function gaussianBlur1ch(data, w, h, radius) {
-  const k = radius * 2 + 1;
-  const kernel = new Float32Array(k);
-  const sigma = radius / 3;
-  let sum = 0;
-  for (let i = 0; i < k; i++) {
-    const x = i - radius;
-    kernel[i] = Math.exp(-(x * x) / (2 * sigma * sigma));
-    sum += kernel[i];
-  }
-  for (let i = 0; i < k; i++) kernel[i] /= sum;
-
-  const tmp = new Float32Array(w * h);
-  // horizontal
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let v = 0;
-      for (let ki = 0; ki < k; ki++) {
-        const xi = Math.min(w - 1, Math.max(0, x + ki - radius));
-        v += data[y * w + xi] * kernel[ki];
-      }
-      tmp[y * w + x] = v;
-    }
-  }
-  const out = new Float32Array(w * h);
-  // vertical
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let v = 0;
-      for (let ki = 0; ki < k; ki++) {
-        const yi = Math.min(h - 1, Math.max(0, y + ki - radius));
-        v += tmp[yi * w + x] * kernel[ki];
-      }
-      out[y * w + x] = v;
-    }
-  }
-  return out;
-}
-
-// Decode SCRFD outputs to bounding boxes + 5 keypoints
-// Following the original SCRFD decode logic
-function decodeSCRFD(outputs, inputW, inputH, threshold = 0.5) {
-  const strides = [8, 16, 32];
-  const fmH = strides.map(s => Math.ceil(inputH / s));
-  const fmW = strides.map(s => Math.ceil(inputW / s));
-  const numAnchors = 2;
-
-  let faces = [];
-  let outIdx = 0;
-
-  for (let si = 0; si < strides.length; si++) {
-    const stride = strides[si];
-    const fh = fmH[si], fw = fmW[si];
-    const n = fh * fw * numAnchors;
-
-    const scores = outputs[outIdx].data;       // [n]
-    const bboxDeltas = outputs[outIdx + 1].data; // [n, 4]
-    const kpsDeltas = outputs[outIdx + 2].data;  // [n, 10]
-    outIdx += 3;
-
-    // Build anchor centers
-    for (let i = 0; i < n; i++) {
-      const score = scores[i];
-      if (score < threshold) continue;
-
-      const ay = Math.floor(i / (fw * numAnchors));
-      const ax = Math.floor((i % (fw * numAnchors)) / numAnchors);
-
-      const cx = (ax + 0.5) * stride;
-      const cy = (ay + 0.5) * stride;
-
-      const x1 = cx - bboxDeltas[i * 4]     * stride;
-      const y1 = cy - bboxDeltas[i * 4 + 1] * stride;
-      const x2 = cx + bboxDeltas[i * 4 + 2] * stride;
-      const y2 = cy + bboxDeltas[i * 4 + 3] * stride;
-
-      const kps = new Float32Array(10);
-      for (let k = 0; k < 5; k++) {
-        kps[k * 2]     = cx + kpsDeltas[i * 10 + k * 2]     * stride;
-        kps[k * 2 + 1] = cy + kpsDeltas[i * 10 + k * 2 + 1] * stride;
-      }
-
-      faces.push({ score, x1, y1, x2, y2, kps });
-    }
-  }
-
-  // NMS
-  faces.sort((a, b) => b.score - a.score);
-  const keep = [];
-  const used = new Set();
-  for (let i = 0; i < faces.length; i++) {
-    if (used.has(i)) continue;
-    keep.push(faces[i]);
-    for (let j = i + 1; j < faces.length; j++) {
-      if (iou(faces[i], faces[j]) > 0.4) used.add(j);
-    }
-  }
-  return keep;
-}
+// ─── SCRFD face detection ─────────────────────────────────────────────────────
 
 function iou(a, b) {
   const ix1 = Math.max(a.x1, b.x1), iy1 = Math.max(a.y1, b.y1);
   const ix2 = Math.min(a.x2, b.x2), iy2 = Math.min(a.y2, b.y2);
   if (ix2 <= ix1 || iy2 <= iy1) return 0;
   const inter = (ix2 - ix1) * (iy2 - iy1);
-  const aA = (a.x2 - a.x1) * (a.y2 - a.y1);
-  const bA = (b.x2 - b.x1) * (b.y2 - b.y1);
-  return inter / (aA + bA - inter);
+  return inter / ((a.x2-a.x1)*(a.y2-a.y1) + (b.x2-b.x1)*(b.y2-b.y1) - inter);
 }
 
-// Detect faces in an image (canvas ImageData → list of face objects)
-async function detectFaces(imgData, W, H) {
-  const det = sessions.det;
-  if (!det) throw new Error('Detection model not loaded');
+function decodeSCRFD(outputs, inputW, inputH, threshold = 0.45) {
+  const strides = [8, 16, 32];
+  const numAnchors = 2;
+  const faces = [];
 
+  let outIdx = 0;
+  for (let si = 0; si < strides.length; si++) {
+    const stride = strides[si];
+    const fh = Math.ceil(inputH / stride);
+    const fw = Math.ceil(inputW / stride);
+    const n = fh * fw * numAnchors;
+
+    const scores  = outputs[outIdx].data;
+    const bboxD   = outputs[outIdx + 1].data;
+    const kpsD    = outputs[outIdx + 2].data;
+    outIdx += 3;
+
+    for (let i = 0; i < n; i++) {
+      if (scores[i] < threshold) continue;
+      const ay = Math.floor(i / (fw * numAnchors));
+      const ax = Math.floor((i % (fw * numAnchors)) / numAnchors);
+      const cx = (ax + 0.5) * stride, cy = (ay + 0.5) * stride;
+
+      faces.push({
+        score: scores[i],
+        x1: cx - bboxD[i*4]   * stride, y1: cy - bboxD[i*4+1] * stride,
+        x2: cx + bboxD[i*4+2] * stride, y2: cy + bboxD[i*4+3] * stride,
+        kps: Array.from({ length: 10 }, (_, k) => {
+          const isX = k % 2 === 0;
+          return (isX ? cx : cy) + kpsD[i*10 + k] * stride;
+        }),
+      });
+    }
+  }
+
+  // NMS
+  faces.sort((a, b) => b.score - a.score);
+  const keep = [], used = new Set();
+  for (let i = 0; i < faces.length; i++) {
+    if (used.has(i)) continue;
+    keep.push(faces[i]);
+    for (let j = i + 1; j < faces.length; j++) {
+      if (!used.has(j) && iou(faces[i], faces[j]) > 0.4) used.add(j);
+    }
+  }
+  return keep;
+}
+
+async function detectFaces(pixels, W, H) {
   const inputSize = 640;
-  // Resize image to 640x640 with letterbox
   const scale = Math.min(inputSize / W, inputSize / H);
   const newW = Math.round(W * scale), newH = Math.round(H * scale);
-  const padX = Math.floor((inputSize - newW) / 2), padY = Math.floor((inputSize - newH) / 2);
+  const padX = Math.floor((inputSize - newW) / 2);
+  const padY = Math.floor((inputSize - newH) / 2);
 
-  const canvas = createCanvas(inputSize, inputSize);
-  const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgb(128,128,128)';
-  ctx.fillRect(0, 0, inputSize, inputSize);
+  // Resize + letterbox using sharp
+  const resizedBuf = await sharp(Buffer.from(pixels), { raw: { width: W, height: H, channels: 4 } })
+    .resize(newW, newH, { fit: 'fill', kernel: 'lanczos3' })
+    .raw()
+    .toBuffer();
 
-  const srcCanvas = createCanvas(W, H);
-  const srcCtx = srcCanvas.getContext('2d');
-  const id = createImageData(
-    Uint8ClampedArray.from(imgData), W, H
-  );
-  srcCtx.putImageData(id, 0, 0);
-  ctx.drawImage(srcCanvas, padX, padY, newW, newH);
+  // Create 640×640 gray canvas, paste resized image
+  const padded = new Uint8Array(inputSize * inputSize * 4);
+  padded.fill(128); // gray letterbox
+  for (let y = 0; y < newH; y++) {
+    for (let x = 0; x < newW; x++) {
+      const si = (y * newW + x) * 4;
+      const di = ((y + padY) * inputSize + (x + padX)) * 4;
+      padded[di]     = resizedBuf[si];
+      padded[di + 1] = resizedBuf[si + 1];
+      padded[di + 2] = resizedBuf[si + 2];
+      padded[di + 3] = 255;
+    }
+  }
 
-  const padded = ctx.getImageData(0, 0, inputSize, inputSize).data;
-
-  // BGR blob, mean subtract: (x - 127.5) / 128
+  // BGR CHW, mean 127.5 std 128
   const blob = new Float32Array(3 * inputSize * inputSize);
   const n = inputSize * inputSize;
   for (let i = 0; i < n; i++) {
-    blob[i]         = (padded[i * 4]     - 127.5) / 128.0; // R
-    blob[n + i]     = (padded[i * 4 + 1] - 127.5) / 128.0; // G
-    blob[2 * n + i] = (padded[i * 4 + 2] - 127.5) / 128.0; // B
+    blob[i]         = (padded[i*4]     - 127.5) / 128; // R
+    blob[n + i]     = (padded[i*4 + 1] - 127.5) / 128; // G
+    blob[2*n + i]   = (padded[i*4 + 2] - 127.5) / 128; // B
   }
 
-  const inputTensor = new Tensor('float32', blob, [1, 3, inputSize, inputSize]);
-  const results = await det.run({ input: inputTensor });
+  const result = await sessions.det.run({
+    input: new Tensor('float32', blob, [1, 3, inputSize, inputSize]),
+  });
+  const faces = decodeSCRFD(Object.values(result), inputSize, inputSize);
 
-  const outputValues = Object.values(results);
-  const faces = decodeSCRFD(outputValues, inputSize, inputSize, 0.4);
-
-  // Scale back to original image coordinates
+  // Rescale to original coords
   return faces.map(f => ({
     ...f,
-    x1: (f.x1 - padX) / scale,
-    y1: (f.y1 - padY) / scale,
-    x2: (f.x2 - padX) / scale,
-    y2: (f.y2 - padY) / scale,
+    x1:  (f.x1 - padX) / scale, y1:  (f.y1 - padY) / scale,
+    x2:  (f.x2 - padX) / scale, y2:  (f.y2 - padY) / scale,
     kps: f.kps.map((v, i) => i % 2 === 0 ? (v - padX) / scale : (v - padY) / scale),
   }));
 }
 
-// Get best (largest) face from detection results
 function getBestFace(faces) {
   if (!faces.length) return null;
-  return faces.reduce((best, f) => {
-    const area = (f.x2 - f.x1) * (f.y2 - f.y1);
-    const bestArea = (best.x2 - best.x1) * (best.y2 - best.y1);
-    return area > bestArea ? f : best;
-  });
+  return faces.reduce((b, f) =>
+    (f.x2-f.x1)*(f.y2-f.y1) > (b.x2-b.x1)*(b.y2-b.y1) ? f : b
+  );
 }
 
-// Extract ArcFace embedding from an aligned face crop
-async function getEmbedding(pixelData, W, H, kps) {
-  const arcfaceSize = 112;
-  const M = estimateNorm(kps, arcfaceSize);
-  const cropped = warpAffine(pixelData, W, H, M, arcfaceSize);
-  const blob = pixelsToBlob(cropped, arcfaceSize, arcfaceSize, 'arcface');
+// ─── ArcFace embedding ────────────────────────────────────────────────────────
 
-  const inputTensor = new Tensor('float32', blob, [1, 3, arcfaceSize, arcfaceSize]);
-  const arcInputName = sessions.arcface.inputNames[0];
-  const arcOutputName = sessions.arcface.outputNames[0];
-  const result = await sessions.arcface.run({ [arcInputName]: inputTensor });
-  const emb = result[arcOutputName].data;
+async function getEmbedding(pixels, W, H, kps) {
+  const sz = 112;
+  const M  = estimateNorm(kps, sz);
+  const aligned = warpAffine(pixels, W, H, M, sz);
+  const blob = pixelsToBlob(aligned, sz, sz, 'arcface');
 
-  // Normalize
+  const inName  = sessions.arcface.inputNames[0];
+  const outName = sessions.arcface.outputNames[0];
+  const result  = await sessions.arcface.run({
+    [inName]: new Tensor('float32', blob, [1, 3, sz, sz]),
+  });
+  const emb = result[outName].data;
+
   let norm = 0;
-  for (let i = 0; i < emb.length; i++) norm += emb[i] * emb[i];
+  for (const v of emb) norm += v * v;
   norm = Math.sqrt(norm);
   const normed = new Float32Array(emb.length);
   for (let i = 0; i < emb.length; i++) normed[i] = emb[i] / norm;
   return normed;
 }
 
-// Load embedding map (emap) from inswapper ONNX model.
-// The emap is a [512,512] initializer tensor; we parse it from raw protobuf.
+// ─── InSwapper emap extraction ────────────────────────────────────────────────
+
 async function loadSwapperEmap() {
   try {
-    const { readFile } = await import('fs/promises');
     const buf = await readFile(MODEL_PATHS.swapper);
-
     const { Root } = await import('protobufjs');
+
     const root = Root.fromJSON({
       nested: {
         TensorProto: {
@@ -459,235 +441,207 @@ async function loadSwapperEmap() {
             float_data: { id: 4, rule: 'repeated', type: 'float', options: { packed: true } },
             name:       { id: 8, rule: 'optional', type: 'string' },
             raw_data:   { id: 9, rule: 'optional', type: 'bytes' },
-          }
+          },
         },
         GraphProto: {
           fields: {
             node:        { id: 1, rule: 'repeated', type: 'NodeProto' },
             initializer: { id: 6, rule: 'repeated', type: 'TensorProto' },
-          }
+          },
         },
-        NodeProto: {
-          fields: { output: { id: 2, rule: 'repeated', type: 'string' } }
-        },
-        ModelProto: {
-          fields: {
-            graph: { id: 7, rule: 'optional', type: 'GraphProto' },
-          }
-        },
-      }
+        NodeProto: { fields: { output: { id: 2, rule: 'repeated', type: 'string' } } },
+        ModelProto: { fields: { graph: { id: 7, rule: 'optional', type: 'GraphProto' } } },
+      },
     });
 
-    const ModelProto = root.lookupType('ModelProto');
-    const model = ModelProto.decode(buf);
-    const initializers = model.graph?.initializer ?? [];
-
-    for (let i = initializers.length - 1; i >= 0; i--) {
-      const t = initializers[i];
-      const dims = Array.from(t.dims ?? []);
-      if (dims.length === 2 && Number(dims[0]) === 512 && Number(dims[1]) === 512) {
-        let emap = null;
-        if (t.raw_data && t.raw_data.length >= 512 * 512 * 4) {
+    const model = root.lookupType('ModelProto').decode(buf);
+    const inits = model.graph?.initializer ?? [];
+    for (let i = inits.length - 1; i >= 0; i--) {
+      const t = inits[i];
+      const dims = Array.from(t.dims ?? []).map(Number);
+      if (dims.length === 2 && dims[0] === 512 && dims[1] === 512) {
+        if (t.raw_data?.length >= 512 * 512 * 4) {
           const arr = new Float32Array(t.raw_data.buffer, t.raw_data.byteOffset, 512 * 512);
-          emap = Float32Array.from(arr);
-        } else if (t.float_data && t.float_data.length === 512 * 512) {
-          emap = Float32Array.from(t.float_data);
+          console.log('[FaceSwap] emap extracted from model initializer', i);
+          return Float32Array.from(arr);
         }
-        if (emap) {
-          console.log('[FaceSwap] emap loaded from initializer', i);
-          return emap;
+        if (t.float_data?.length === 512 * 512) {
+          console.log('[FaceSwap] emap (float_data) extracted from initializer', i);
+          return Float32Array.from(t.float_data);
         }
       }
     }
-    console.warn('[FaceSwap] emap not found in model, identity pass-through will be used');
+    console.warn('[FaceSwap] emap not found — identity pass-through');
     return null;
   } catch (e) {
-    console.warn('[FaceSwap] Could not load emap:', e.message);
+    console.warn('[FaceSwap] emap load error:', e.message);
     return null;
   }
 }
 
-// Run face swap: source embedding + target crop → swapped face
-async function runSwapper(targetPixels, targetW, targetH, targetKps, sourceEmbedding) {
-  const swapSize = 128;
-  const M = estimateNorm(targetKps, swapSize);
-  const alignedPixels = warpAffine(targetPixels, targetW, targetH, M, swapSize);
+// ─── InSwapper inference ──────────────────────────────────────────────────────
 
-  // Target blob: (pixel / 255) - 0.0, std 1.0 → just / 255
-  const targetBlob = pixelsToBlob(alignedPixels, swapSize, swapSize, 'swapper');
+async function runSwapper(pixels, W, H, kps, srcEmbedding) {
+  const sz = 128;
+  const M  = estimateNorm(kps, sz);
+  const aligned = warpAffine(pixels, W, H, M, sz);
+  const blob = pixelsToBlob(aligned, sz, sz, 'swapper');
 
-  // Latent: normed_embedding @ emap, then re-normalize
+  // Compute latent: normed_emb @ emap, re-normalize
+  const dim = 512;
   let latent;
   if (swapperEmap) {
-    // Matrix multiply: [1,512] @ [512,512] → [1,512]
-    const dim = 512;
     latent = new Float32Array(dim);
     for (let j = 0; j < dim; j++) {
-      let sum = 0;
-      for (let k = 0; k < dim; k++) {
-        sum += sourceEmbedding[k] * swapperEmap[k * dim + j];
-      }
-      latent[j] = sum;
+      let s = 0;
+      for (let k = 0; k < dim; k++) s += srcEmbedding[k] * swapperEmap[k * dim + j];
+      latent[j] = s;
     }
     let norm = 0;
-    for (let i = 0; i < dim; i++) norm += latent[i] * latent[i];
+    for (const v of latent) norm += v * v;
     norm = Math.sqrt(norm);
     for (let i = 0; i < dim; i++) latent[i] /= norm;
   } else {
-    latent = sourceEmbedding;
+    latent = srcEmbedding;
   }
 
-  const swapperInputNames = sessions.swapper.inputNames;
-  const inputs = {
-    [swapperInputNames[0]]: new Tensor('float32', targetBlob, [1, 3, swapSize, swapSize]),
-    [swapperInputNames[1]]: new Tensor('float32', latent, [1, 512]),
-  };
-
-  const outName = sessions.swapper.outputNames[0];
-  const result = await sessions.swapper.run(inputs);
-  const pred = result[outName].data;
-
-  return { pred, M, alignedPixels };
+  const [inN0, inN1] = sessions.swapper.inputNames;
+  const outN = sessions.swapper.outputNames[0];
+  const result = await sessions.swapper.run({
+    [inN0]: new Tensor('float32', blob,   [1, 3, sz, sz]),
+    [inN1]: new Tensor('float32', latent, [1, dim]),
+  });
+  return { pred: result[outN].data, M, aligned };
 }
 
-// Paste swapped face back onto full frame
-function pasteBack(targetPixels, targetW, targetH, swappedPred, alignedPixels, M, swapSize) {
-  const fakePx = predToPixels(swappedPred, swapSize);
-  const M_inv = invertAffine(M);
+// ─── Paste-back with blurred mask ─────────────────────────────────────────────
 
-  // Warp fake face back to full frame
-  const warpedFake = warpAffineInverse(fakePx, swapSize, swapSize, M_inv, targetW, targetH);
+function gaussianBlur1ch(src, w, h, r) {
+  const k = r * 2 + 1, sigma = r / 3;
+  const kern = new Float32Array(k);
+  let s = 0;
+  for (let i = 0; i < k; i++) { const x = i - r; kern[i] = Math.exp(-(x*x)/(2*sigma*sigma)); s += kern[i]; }
+  for (let i = 0; i < k; i++) kern[i] /= s;
 
-  // Build mask: white where fake was, erode + blur edges
-  const rawMask = new Float32Array(targetW * targetH);
-  for (let i = 0; i < targetW * targetH; i++) {
-    rawMask[i] = warpedFake[i * 4 + 3] > 0 ? 255 : 0;
-  }
-
-  // Erode by 5px
-  const eroded = new Float32Array(targetW * targetH);
-  const erR = 5;
-  for (let y = 0; y < targetH; y++) {
-    for (let x = 0; x < targetW; x++) {
-      let min = 255;
-      for (let dy = -erR; dy <= erR; dy++) {
-        for (let dx = -erR; dx <= erR; dx++) {
-          const nx = Math.min(targetW - 1, Math.max(0, x + dx));
-          const ny = Math.min(targetH - 1, Math.max(0, y + dy));
-          if (rawMask[ny * targetW + nx] < min) min = rawMask[ny * targetW + nx];
-        }
-      }
-      eroded[y * targetW + x] = min;
+  const tmp = new Float32Array(w * h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      for (let ki = 0; ki < k; ki++) { const xi = Math.min(w-1, Math.max(0, x+ki-r)); v += src[y*w+xi]*kern[ki]; }
+      tmp[y*w+x] = v;
     }
-  }
+  const out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      let v = 0;
+      for (let ki = 0; ki < k; ki++) { const yi = Math.min(h-1, Math.max(0, y+ki-r)); v += tmp[yi*w+x]*kern[ki]; }
+      out[y*w+x] = v;
+    }
+  return out;
+}
 
-  // Gaussian blur mask
-  const blurR = Math.max(10, Math.floor(Math.sqrt(targetW * targetH / (640 * 480)) * 20));
-  const blurredMask = gaussianBlur1ch(eroded, targetW, targetH, blurR);
+function pasteBack(targetPixels, W, H, pred, M, swapSize) {
+  const fakePx  = predToPixels(pred, swapSize);
+  const M_inv   = invertAffine(M);
+  const warped  = warpAffineBack(fakePx, swapSize, swapSize, M_inv, W, H);
 
-  // Composite
-  const out = new Uint8ClampedArray(targetPixels.length);
-  for (let i = 0; i < targetW * targetH; i++) {
-    const alpha = blurredMask[i] / 255;
-    out[i * 4]     = Math.round(alpha * warpedFake[i * 4]     + (1 - alpha) * targetPixels[i * 4]);
-    out[i * 4 + 1] = Math.round(alpha * warpedFake[i * 4 + 1] + (1 - alpha) * targetPixels[i * 4 + 1]);
-    out[i * 4 + 2] = Math.round(alpha * warpedFake[i * 4 + 2] + (1 - alpha) * targetPixels[i * 4 + 2]);
-    out[i * 4 + 3] = 255;
+  // Build raw mask from warped alpha
+  const rawMask = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) rawMask[i] = warped[i*4+3] > 0 ? 255 : 0;
+
+  // Erode 5px
+  const erR = 5;
+  const eroded = new Float32Array(W * H);
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      let mn = 255;
+      for (let dy = -erR; dy <= erR; dy++)
+        for (let dx = -erR; dx <= erR; dx++) {
+          const v = rawMask[Math.min(H-1,Math.max(0,y+dy))*W + Math.min(W-1,Math.max(0,x+dx))];
+          if (v < mn) mn = v;
+        }
+      eroded[y*W+x] = mn;
+    }
+
+  const blurR = Math.max(8, Math.floor(Math.sqrt(W*H/(640*480))*16));
+  const mask  = gaussianBlur1ch(eroded, W, H, blurR);
+
+  const out = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) {
+    const a = mask[i] / 255;
+    out[i*4]   = Math.round(a * warped[i*4]   + (1-a) * targetPixels[i*4]);
+    out[i*4+1] = Math.round(a * warped[i*4+1] + (1-a) * targetPixels[i*4+1]);
+    out[i*4+2] = Math.round(a * warped[i*4+2] + (1-a) * targetPixels[i*4+2]);
+    out[i*4+3] = 255;
   }
   return out;
 }
 
-// ─── Public API ─────────────────────────────────────────────────────────────
+// ─── Public API ───────────────────────────────────────────────────────────────
 
 let referenceEmbedding = null;
 
 export async function initialize(onProgress) {
-  if (initState === 'ready') return;
-  if (initState === 'loading' || initState === 'downloading') return;
-
+  if (initState === 'ready' || initState === 'loading' || initState === 'downloading') return;
   try {
     initState = 'downloading';
-    onProgress?.({ state: 'downloading', message: 'Downloading AI models (this takes a few minutes)...' });
-
-    // Download models in parallel where possible
+    onProgress?.({ state: 'downloading', message: 'Downloading det_10g.onnx (16 MB)...' });
     await ensureModel('det');
-    onProgress?.({ state: 'downloading', message: 'Downloading ArcFace identity model...', progress: downloadProgress });
+
+    onProgress?.({ state: 'downloading', message: 'Downloading w600k_r50.onnx (166 MB)...' });
     await ensureModel('arcface');
-    onProgress?.({ state: 'downloading', message: 'Downloading InSwapper face synthesis model...', progress: downloadProgress });
+
+    onProgress?.({ state: 'downloading', message: 'Downloading inswapper_128.onnx (554 MB)...' });
     await ensureModel('swapper');
 
     initState = 'loading';
     onProgress?.({ state: 'loading', message: 'Loading ONNX sessions...' });
 
     const opts = { executionProviders: ['cpu'] };
-
     sessions.det     = await InferenceSession.create(MODEL_PATHS.det,     opts);
-    onProgress?.({ state: 'loading', message: 'Loaded face detector...' });
     sessions.arcface = await InferenceSession.create(MODEL_PATHS.arcface,  opts);
-    onProgress?.({ state: 'loading', message: 'Loaded ArcFace model...' });
     sessions.swapper = await InferenceSession.create(MODEL_PATHS.swapper,  opts);
-    onProgress?.({ state: 'loading', message: 'Loaded InSwapper model...' });
 
-    console.log('[FaceSwap] Swapper input names:', sessions.swapper.inputNames);
-    console.log('[FaceSwap] Swapper output names:', sessions.swapper.outputNames);
-
+    console.log('[FaceSwap] Swapper inputs:', sessions.swapper.inputNames);
     swapperEmap = await loadSwapperEmap();
 
     initState = 'ready';
     onProgress?.({ state: 'ready', message: 'AI transformation engine ready' });
-    console.log('[FaceSwap] All models loaded and ready');
+    console.log('[FaceSwap] All models loaded');
   } catch (err) {
     initState = 'error';
     initError = err.message;
-    console.error('[FaceSwap] Initialization error:', err);
     onProgress?.({ state: 'error', message: err.message });
+    console.error('[FaceSwap] Init error:', err);
     throw err;
   }
 }
 
 export async function registerReferenceFace(imageBuffer) {
-  if (initState !== 'ready') throw new Error(`Engine not ready: ${initState}`);
+  if (initState !== 'ready') throw new Error(`Engine not ready (${initState})`);
 
-  const img = await loadImage(imageBuffer);
-  const W = img.width, H = img.height;
-  const canvas = createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(img, 0, 0);
-  const { data } = ctx.getImageData(0, 0, W, H);
-
-  const faces = await detectFaces(data, W, H);
-  const best = getBestFace(faces);
+  const { data, width, height } = await decodeToRGBA(imageBuffer);
+  const faces = await detectFaces(data, width, height);
+  const best  = getBestFace(faces);
   if (!best) throw new Error('No face detected in reference image');
 
-  referenceEmbedding = await getEmbedding(data, W, H, Array.from(best.kps));
-  console.log('[FaceSwap] Reference face registered, embedding dim:', referenceEmbedding.length);
+  referenceEmbedding = await getEmbedding(data, width, height, best.kps);
+  console.log('[FaceSwap] Reference embedded, dim:', referenceEmbedding.length);
   return { success: true, bbox: { x1: best.x1, y1: best.y1, x2: best.x2, y2: best.y2 } };
 }
 
 export async function transformFrame(jpegBuffer) {
-  if (initState !== 'ready') return null;
-  if (!referenceEmbedding) return null;
+  if (initState !== 'ready' || !referenceEmbedding) return null;
 
-  const img = await loadImage(jpegBuffer);
-  const W = img.width, H = img.height;
-  const canvas = createCanvas(W, H);
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(img, 0, 0);
-  const { data } = ctx.getImageData(0, 0, W, H);
-
-  const faces = await detectFaces(data, W, H);
-  const best = getBestFace(faces);
+  const { data, width, height } = await decodeToRGBA(jpegBuffer);
+  const faces = await detectFaces(data, width, height);
+  const best  = getBestFace(faces);
   if (!best) return null;
 
-  const { pred, M, alignedPixels } = await runSwapper(data, W, H, Array.from(best.kps), referenceEmbedding);
-  const resultPixels = pasteBack(data, W, H, pred, alignedPixels, M, 128);
+  const { pred, M } = await runSwapper(data, width, height, best.kps, referenceEmbedding);
+  const resultPixels = pasteBack(data, width, height, pred, M, 128);
 
-  // Encode result to JPEG
-  const outCanvas = createCanvas(W, H);
-  const outCtx = outCanvas.getContext('2d');
-  const outId = createImageData(resultPixels, W, H);
-  outCtx.putImageData(outId, 0, 0);
-  return outCanvas.toBuffer('image/jpeg', { quality: 0.85 });
+  return encodeToJPEG(resultPixels, width, height, 85);
 }
 
 export function clearReference() {
