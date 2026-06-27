@@ -55,33 +55,130 @@ export function getInitState() {
   return { state: initState, error: initError, progress: { ...downloadProgress } };
 }
 
-// ─── HTTP download with redirect following ───────────────────────────────────
-function downloadFile(url, dest, label) {
-  return new Promise((resolve, reject) => {
-    const attempt = (u) => {
+// ─── HTTP download: redirect-following, resume, retry, progress ──────────────
+
+const STALL_TIMEOUT_MS  = 60_000;  // abort if no data received for 60s
+const MAX_RETRIES       = 5;
+const RETRY_DELAY_MS    = 3_000;
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * Download url → dest with:
+ *  - automatic redirect following
+ *  - Range resume if partial file exists
+ *  - stall detection (60 s without data → retry)
+ *  - up to MAX_RETRIES retries with back-off
+ *  - MB/total progress logging
+ */
+async function downloadFile(url, dest, label) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const alreadyBytes = existsSync(dest) ? statSync(dest).size : 0;
+    const success = await attemptDownload(url, dest, label, alreadyBytes);
+    if (success) return;
+    if (attempt < MAX_RETRIES) {
+      const wait = RETRY_DELAY_MS * attempt;
+      console.warn(`[FaceSwap] ${label} download failed (attempt ${attempt}/${MAX_RETRIES}), retrying in ${wait/1000}s…`);
+      await sleep(wait);
+    }
+  }
+  throw new Error(`Failed to download ${label} after ${MAX_RETRIES} attempts`);
+}
+
+function attemptDownload(url, dest, label, resumeFrom) {
+  return new Promise((resolve) => {
+    const followRedirects = (u, rangeStart) => {
       const mod = u.startsWith('https') ? https : http;
-      const req = mod.get(u, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      const headers = { 'User-Agent': 'Mozilla/5.0' };
+      if (rangeStart > 0) headers['Range'] = `bytes=${rangeStart}-`;
+
+      const req = mod.get(u, { headers }, (res) => {
+        // Follow redirects (carry range header through)
         if ([301, 302, 307, 308].includes(res.statusCode)) {
-          return attempt(res.headers.location);
+          res.resume(); // drain
+          return followRedirects(res.headers.location, rangeStart);
         }
-        if (res.statusCode !== 200) {
-          return reject(new Error(`HTTP ${res.statusCode} downloading ${label}`));
+
+        // 416 = range not satisfiable — server may not support resume, restart
+        if (res.statusCode === 416) {
+          res.resume();
+          return followRedirects(u, 0);
         }
-        const total = parseInt(res.headers['content-length'] || '0', 10);
-        let received = 0;
-        const ws = createWriteStream(dest);
+
+        const isPartial = res.statusCode === 206;
+        if (res.statusCode !== 200 && !isPartial) {
+          res.resume();
+          console.warn(`[FaceSwap] ${label} HTTP ${res.statusCode}`);
+          return resolve(false);
+        }
+
+        const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+        const total   = contentLength > 0 ? contentLength + (isPartial ? rangeStart : 0) : 0;
+        let received  = isPartial ? rangeStart : 0;
+        let lastData  = Date.now();
+        let settled   = false;
+
+        const finish = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+
+        // Stall watchdog — fires if no data for STALL_TIMEOUT_MS
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastData > STALL_TIMEOUT_MS) {
+            clearInterval(watchdog);
+            req.destroy();
+            console.warn(`[FaceSwap] ${label} stalled — no data for ${STALL_TIMEOUT_MS/1000}s`);
+            finish(false);
+          }
+        }, 5_000);
+
+        const ws = createWriteStream(dest, isPartial ? { flags: 'a' } : { flags: 'w' });
+
         res.on('data', (chunk) => {
           received += chunk.length;
-          if (total > 0) downloadProgress[label] = Math.round((received / total) * 100);
+          lastData = Date.now();
+          if (total > 0) {
+            const pct = Math.round((received / total) * 100);
+            const mb  = (received / 1_000_000).toFixed(1);
+            const tot = (total    / 1_000_000).toFixed(1);
+            downloadProgress[label] = pct;
+            // Log every 5%
+            if (pct % 5 === 0 && downloadProgress[`${label}_lastLog`] !== pct) {
+              downloadProgress[`${label}_lastLog`] = pct;
+              console.log(`[FaceSwap] ${label}: ${mb} MB / ${tot} MB (${pct}%)`);
+            }
+          }
         });
+
         res.pipe(ws);
-        ws.on('finish', () => { downloadProgress[label] = 100; resolve(); });
-        ws.on('error', reject);
+
+        ws.on('finish', () => {
+          clearInterval(watchdog);
+          downloadProgress[label] = 100;
+          console.log(`[FaceSwap] ${label} download complete (${(received/1_000_000).toFixed(1)} MB)`);
+          finish(true);
+        });
+
+        ws.on('error', (err) => {
+          clearInterval(watchdog);
+          console.warn(`[FaceSwap] ${label} write error:`, err.message);
+          finish(false);
+        });
+
+        res.on('error', (err) => {
+          clearInterval(watchdog);
+          ws.destroy();
+          console.warn(`[FaceSwap] ${label} response error:`, err.message);
+          finish(false);
+        });
       });
-      req.on('error', reject);
-      req.setTimeout(60000, () => { req.destroy(); reject(new Error(`Timeout downloading ${label}`)); });
+
+      req.on('error', (err) => {
+        console.warn(`[FaceSwap] ${label} request error:`, err.message);
+        resolve(false);
+      });
+      // No req.setTimeout — stall watchdog handles it per-data-event
     };
-    attempt(url);
+
+    followRedirects(url, resumeFrom);
   });
 }
 
@@ -92,10 +189,16 @@ async function ensureModel(key) {
     console.log(`[FaceSwap] ${key} already cached`);
     return;
   }
-  console.log(`[FaceSwap] Downloading ${key}...`);
+  // Partial file exists — will resume
+  const partial = existsSync(path) ? statSync(path).size : 0;
+  if (partial > 0) {
+    console.log(`[FaceSwap] Resuming ${key} from ${(partial/1_000_000).toFixed(1)} MB…`);
+  } else {
+    console.log(`[FaceSwap] Downloading ${key}…`);
+  }
   downloadProgress[key] = 0;
   await downloadFile(MODEL_URLS[key], path, key);
-  console.log(`[FaceSwap] ${key} downloaded`);
+  console.log(`[FaceSwap] ${key} ready`);
 }
 
 // ─── Image helpers via sharp (no canvas, no native build required) ────────────
