@@ -14,7 +14,6 @@ interface UseFaceTransformReturn {
   initializeTransform: (stream: MediaStream) => Promise<void>;
   updateBackground: (backgroundId: string) => void;
   cleanup: () => void;
-  debugFrameUrl: string | null;
 }
 
 export const backgroundOptions: BackgroundOption[] = [
@@ -52,17 +51,15 @@ export const backgroundOptions: BackgroundOption[] = [
 ];
 
 const SERVER = 'http://localhost:3001';
-// How often to send frames to the AI server (ms). 
-// CPU inference on inswapper takes ~200-500ms per frame, so 4fps is realistic.
-const TRANSFORM_INTERVAL_MS = 250;
+// How often to send frames to the AI server (ms).
+// CPU inference on inswapper takes ~200-500ms per frame, so 3fps balances quality vs lag.
+const TRANSFORM_INTERVAL_MS = 333;
 
 export function useFaceTransform(): UseFaceTransformReturn {
   const [processedStream, setProcessedStream] = useState<MediaStream | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [statusMessage, setStatusMessage] = useState('Camera Ready');
   const [modelLoadProgress, setModelLoadProgress] = useState(0);
-  const [debugFrameUrl, setDebugFrameUrl] = useState<string | null>(null);
-  const debugFrameUrlRef = useRef<string | null>(null);
   const [transformationSettings, setTransformationSettings] = useState<TransformationSettings>({
     enabled: false,
     referenceImage: null,
@@ -225,7 +222,8 @@ export function useFaceTransform(): UseFaceTransformReturn {
 
     try {
       // Capture current video frame at reduced resolution for speed
-      const W = Math.min(640, videoEl.videoWidth);
+      // 480p is sufficient for face swap while keeping processing fast
+      const W = Math.min(480, videoEl.videoWidth);
       const H = Math.round(W * videoEl.videoHeight / videoEl.videoWidth);
       const cap = document.createElement('canvas');
       cap.width = W; cap.height = H;
@@ -254,12 +252,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
       const jpegBlob = await res.blob();
       console.log('[Transform] Received transformed frame, size:', jpegBlob.size, 'bytes');
       const url = URL.createObjectURL(jpegBlob);
-
-      // Capture a separate blob URL for the debug panel — independent lifecycle from swapped frame
-      const debugUrl = URL.createObjectURL(jpegBlob);
-      if (debugFrameUrlRef.current) URL.revokeObjectURL(debugFrameUrlRef.current);
-      debugFrameUrlRef.current = debugUrl;
-      setDebugFrameUrl(debugUrl);
 
       const img = new Image();
       img.onload = () => {
@@ -453,8 +445,6 @@ export function useFaceTransform(): UseFaceTransformReturn {
     if (hostVideoRef.current) { hostVideoRef.current.pause(); hostVideoRef.current.srcObject = null; hostVideoRef.current = null; }
     if (swappedFrameRef.current?.src?.startsWith('blob:')) URL.revokeObjectURL(swappedFrameRef.current.src);
     swappedFrameRef.current = null;
-    if (debugFrameUrlRef.current) { URL.revokeObjectURL(debugFrameUrlRef.current); debugFrameUrlRef.current = null; }
-    setDebugFrameUrl(null);
     bgImgRef.current = null;
     outputCanvasRef.current = null;
     segResultRef.current = null;
@@ -486,6 +476,5 @@ export function useFaceTransform(): UseFaceTransformReturn {
     initializeTransform,
     updateBackground,
     cleanup,
-    debugFrameUrl,
   };
 }

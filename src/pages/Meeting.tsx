@@ -7,7 +7,7 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { useFaceTransform } from '../hooks/useFaceTransform';
 import { socket } from '../lib/socket';
 import {
-  Video, VideoOff, Mic, MicOff, PhoneOff, Copy, Check, Users, PanelRightOpen, AlertCircle, Download
+  Video, VideoOff, Mic, MicOff, PhoneOff, Copy, Check, Users, PanelRightOpen, AlertCircle
 } from 'lucide-react';
 
 export default function Meeting() {
@@ -43,7 +43,6 @@ export default function Meeting() {
     statusMessage,
     modelLoadProgress,
     cleanup: cleanupTransform,
-    debugFrameUrl,
   } = useFaceTransform();
 
   useEffect(() => {
@@ -373,27 +372,6 @@ export default function Meeting() {
         )}
       </div>
 
-      {/* DEBUG: raw AI output panel — exact JPEG from server, no canvas processing */}
-      {debugFrameUrl && (
-        <div className="fixed top-20 left-4 z-50 bg-dark-900 border-2 border-yellow-400 rounded-xl overflow-hidden shadow-2xl w-72">
-          <div className="flex items-center justify-between px-3 py-2 bg-yellow-400/20 border-b border-yellow-400/40">
-            <span className="text-xs font-mono font-bold text-yellow-400">RAW AI OUTPUT (DEBUG)</span>
-            <a
-              href={debugFrameUrl}
-              download="ai-output.jpg"
-              className="flex items-center gap-1 px-2 py-1 bg-yellow-400 hover:bg-yellow-300 rounded text-xs text-dark-900 font-bold transition-colors"
-            >
-              <Download size={10} />
-              Save
-            </a>
-          </div>
-          <img
-            src={debugFrameUrl}
-            alt="Raw AI output"
-            className="w-full block"
-          />
-        </div>
-      )}
 
       {/* Footer controls */}
       <footer className="flex-shrink-0 h-16 md:h-20 bg-dark-900/90 backdrop-blur-sm border-t border-dark-700 flex items-center justify-center gap-3 md:gap-4 px-4 z-30">

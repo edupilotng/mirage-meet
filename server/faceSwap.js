@@ -715,7 +715,7 @@ async function runSwapper(pixels, W, H, kps, srcEmbedding) {
   return { pred: result[outN].data, M, aligned };
 }
 
-// ─── Paste-back with blurred mask ─────────────────────────────────────────────
+// ─── Paste-back with blurred mask and color correction ────────────────────────
 
 function gaussianBlur1ch(src, w, h, r) {
   const k = r * 2 + 1, sigma = r / 3;
@@ -741,14 +741,79 @@ function gaussianBlur1ch(src, w, h, r) {
   return out;
 }
 
+/**
+ * Color transfer: adjust swapped face colors to match target face statistics.
+ * Uses Reinhard style mean/std transfer in a single pass for performance.
+ */
+function colorTransfer(warped, target, mask, W, H) {
+  // Single-pass computation of mean and variance for both source and target
+  let tCount = 0, tSumR = 0, tSumG = 0, tSumB = 0;
+  let sCount = 0, sSumR = 0, sSumG = 0, sSumB = 0;
+
+  for (let i = 0; i < W * H; i++) {
+    if (mask[i] > 128) {
+      tCount++;
+      tSumR += target[i*4];
+      tSumG += target[i*4+1];
+      tSumB += target[i*4+2];
+      sCount++;
+      sSumR += warped[i*4];
+      sSumG += warped[i*4+1];
+      sSumB += warped[i*4+2];
+    }
+  }
+  if (tCount < 100) return warped;
+
+  const tMeanR = tSumR / tCount, tMeanG = tSumG / tCount, tMeanB = tSumB / tCount;
+  const sMeanR = sSumR / sCount, sMeanG = sSumG / sCount, sMeanB = sSumB / sCount;
+
+  // Second pass for variance (still need this for std)
+  let tVarR = 0, tVarG = 0, tVarB = 0;
+  let sVarR = 0, sVarG = 0, sVarB = 0;
+  for (let i = 0; i < W * H; i++) {
+    if (mask[i] > 128) {
+      tVarR += (target[i*4] - tMeanR) ** 2;
+      tVarG += (target[i*4+1] - tMeanG) ** 2;
+      tVarB += (target[i*4+2] - tMeanB) ** 2;
+      sVarR += (warped[i*4] - sMeanR) ** 2;
+      sVarG += (warped[i*4+1] - sMeanG) ** 2;
+      sVarB += (warped[i*4+2] - sMeanB) ** 2;
+    }
+  }
+  const tStdR = Math.sqrt(tVarR / tCount) + 1e-6;
+  const tStdG = Math.sqrt(tVarG / tCount) + 1e-6;
+  const tStdB = Math.sqrt(tVarB / tCount) + 1e-6;
+  const sStdR = Math.sqrt(sVarR / sCount) + 1e-6;
+  const sStdG = Math.sqrt(sVarG / sCount) + 1e-6;
+  const sStdB = Math.sqrt(sVarB / sCount) + 1e-6;
+
+  // Apply color transfer
+  const corrected = new Uint8ClampedArray(W * H * 4);
+  for (let i = 0; i < W * H; i++) {
+    const m = mask[i] / 255;
+    if (m > 0.01) {
+      const r = ((warped[i*4] - sMeanR) / sStdR) * tStdR + tMeanR;
+      const g = ((warped[i*4+1] - sMeanG) / sStdG) * tStdG + tMeanG;
+      const b = ((warped[i*4+2] - sMeanB) / sStdB) * tStdB + tMeanB;
+      corrected[i*4]   = Math.max(0, Math.min(255, Math.round(m * r + (1 - m) * warped[i*4])));
+      corrected[i*4+1] = Math.max(0, Math.min(255, Math.round(m * g + (1 - m) * warped[i*4+1])));
+      corrected[i*4+2] = Math.max(0, Math.min(255, Math.round(m * b + (1 - m) * warped[i*4+2])));
+    } else {
+      corrected[i*4]   = warped[i*4];
+      corrected[i*4+1] = warped[i*4+1];
+      corrected[i*4+2] = warped[i*4+2];
+    }
+    corrected[i*4+3] = 255;
+  }
+  return corrected;
+}
+
 function pasteBack(targetPixels, W, H, pred, M, swapSize) {
   const fakePx = predToPixels(pred, swapSize);
   const [a, b, tx, c, d, ty] = M;
 
   // Backward mapping: for each output pixel (x,y) in the full frame, apply M to get
   // the corresponding canonical position in the 128×128 InSwapper output.
-  // This matches: cv2.warpAffine(bgr_fake, M, (W, H)) from the official InsightFace pipeline.
-  // Forward mapping (old warpAffineBack) produced holes for faces larger than 128px.
   const warped  = new Uint8ClampedArray(W * H * 4);
   const rawMask = new Float32Array(W * H);
 
@@ -773,8 +838,8 @@ function pasteBack(targetPixels, W, H, pred, M, swapSize) {
     }
   }
 
-  // Erode 5px to remove boundary artifacts, then Gaussian blur for smooth blending
-  const erR = 5;
+  // Erosion to remove hard boundary
+  const erR = 8;
   const eroded = new Float32Array(W * H);
   for (let y = 0; y < H; y++)
     for (let x = 0; x < W; x++) {
@@ -787,15 +852,19 @@ function pasteBack(targetPixels, W, H, pred, M, swapSize) {
       eroded[y*W+x] = mn;
     }
 
-  const blurR = Math.max(8, Math.floor(Math.sqrt(W*H/(640*480))*16));
+  // Blur for smooth edge blending
+  const blurR = Math.max(10, Math.floor(Math.sqrt(W*H/(480*360))*12));
   const mask  = gaussianBlur1ch(eroded, W, H, blurR);
+
+  // Apply color transfer to match skin tones
+  const colorCorrected = colorTransfer(warped, targetPixels, mask, W, H);
 
   const out = new Uint8ClampedArray(W * H * 4);
   for (let i = 0; i < W * H; i++) {
     const alpha = mask[i] / 255;
-    out[i*4]   = Math.round(alpha * warped[i*4]   + (1-alpha) * targetPixels[i*4]);
-    out[i*4+1] = Math.round(alpha * warped[i*4+1] + (1-alpha) * targetPixels[i*4+1]);
-    out[i*4+2] = Math.round(alpha * warped[i*4+2] + (1-alpha) * targetPixels[i*4+2]);
+    out[i*4]   = Math.round(alpha * colorCorrected[i*4]   + (1-alpha) * targetPixels[i*4]);
+    out[i*4+1] = Math.round(alpha * colorCorrected[i*4+1] + (1-alpha) * targetPixels[i*4+1]);
+    out[i*4+2] = Math.round(alpha * colorCorrected[i*4+2] + (1-alpha) * targetPixels[i*4+2]);
     out[i*4+3] = 255;
   }
   return out;
