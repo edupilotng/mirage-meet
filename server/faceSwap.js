@@ -259,10 +259,9 @@ const ARCFACE_DST = [
  */
 function estimateNorm(srcKps, imageSize = 112) {
   const ratio = imageSize / 112.0;
-  const dx    = imageSize % 128 === 0 ? 8.0 * ratio : 0;
-  const dy    = imageSize % 128 === 0 ? 8.0 * ratio : 0; // offset both X and Y for 128x128
-  const dstX  = ARCFACE_DST.filter((_, i) => i % 2 === 0).map(v => v * ratio + dx);
-  const dstY  = ARCFACE_DST.filter((_, i) => i % 2 !== 0).map(v => v * ratio + dy);
+  // Official InsightFace: simply scale the canonical landmarks by ratio, no offset.
+  const dstX  = ARCFACE_DST.filter((_, i) => i % 2 === 0).map(v => v * ratio);
+  const dstY  = ARCFACE_DST.filter((_, i) => i % 2 !== 0).map(v => v * ratio);
 
   const srcX = srcKps.filter((_, i) => i % 2 === 0);
   const srcY = srcKps.filter((_, i) => i % 2 !== 0);
@@ -321,15 +320,30 @@ function warpAffine(pixels, srcW, srcH, M, outSize) {
 
   for (let y = 0; y < outSize; y++) {
     for (let x = 0; x < outSize; x++) {
-      const sx = Math.round(ia * x + ib * y + itx);
-      const sy = Math.round(ic * x + id2 * y + ity);
+      const fsx = ia * x + ib * y + itx;
+      const fsy = ic * x + id2 * y + ity;
       const di = (y * outSize + x) * 4;
-      if (sx >= 0 && sx < srcW && sy >= 0 && sy < srcH) {
-        const si = (sy * srcW + sx) * 4;
-        out[di]     = pixels[si];
-        out[di + 1] = pixels[si + 1];
-        out[di + 2] = pixels[si + 2];
+      // Bilinear interpolation — matches cv2.warpAffine default (INTER_LINEAR)
+      const x0 = Math.floor(fsx), y0 = Math.floor(fsy);
+      const x1 = x0 + 1,          y1 = y0 + 1;
+      if (x0 >= 0 && x1 < srcW && y0 >= 0 && y1 < srcH) {
+        const fx = fsx - x0, fy = fsy - y0;
+        const w00 = (1 - fx) * (1 - fy);
+        const w10 = fx        * (1 - fy);
+        const w01 = (1 - fx) * fy;
+        const w11 = fx        * fy;
+        const i00 = (y0 * srcW + x0) * 4;
+        const i10 = (y0 * srcW + x1) * 4;
+        const i01 = (y1 * srcW + x0) * 4;
+        const i11 = (y1 * srcW + x1) * 4;
+        out[di]     = Math.round(w00*pixels[i00]   + w10*pixels[i10]   + w01*pixels[i01]   + w11*pixels[i11]);
+        out[di + 1] = Math.round(w00*pixels[i00+1] + w10*pixels[i10+1] + w01*pixels[i01+1] + w11*pixels[i11+1]);
+        out[di + 2] = Math.round(w00*pixels[i00+2] + w10*pixels[i10+2] + w01*pixels[i01+2] + w11*pixels[i11+2]);
         out[di + 3] = 255;
+      } else if (x0 >= 0 && x0 < srcW && y0 >= 0 && y0 < srcH) {
+        // Edge fallback: nearest neighbor
+        const si = (y0 * srcW + x0) * 4;
+        out[di] = pixels[si]; out[di+1] = pixels[si+1]; out[di+2] = pixels[si+2]; out[di+3] = 255;
       }
     }
   }
@@ -608,8 +622,9 @@ async function loadSwapperEmap() {
           if (dataOffset + EMAP_BYTES > buf.length) continue;
           const arr = extractAt(dataOffset);
           if (arr) {
-            console.log('[FaceSwap] emap found via binary scan at offset',
-              dataOffset, '— first values:', arr[0].toFixed(5), arr[1].toFixed(5), arr[2].toFixed(5));
+            let emapMin = Infinity, emapMax = -Infinity, emapAbsSum = 0;
+            for (let ei = 0; ei < arr.length; ei++) { if (arr[ei]<emapMin) emapMin=arr[ei]; if (arr[ei]>emapMax) emapMax=arr[ei]; emapAbsSum+=Math.abs(arr[ei]); }
+            console.log(`[FaceSwap] emap found at offset ${dataOffset} — first3=[${arr[0].toFixed(5)},${arr[1].toFixed(5)},${arr[2].toFixed(5)}] range=[${emapMin.toFixed(5)},${emapMax.toFixed(5)}] absAvg=${(emapAbsSum/arr.length).toFixed(6)}`);
             return Float32Array.from(arr);
           }
         }
@@ -643,13 +658,17 @@ async function loadSwapperEmap() {
 
 // ─── InSwapper inference ──────────────────────────────────────────────────────
 
+let _swapFrameCount = 0;
+
 async function runSwapper(pixels, W, H, kps, srcEmbedding) {
   const sz = 128;
   const M  = estimateNorm(kps, sz);
   const aligned = warpAffine(pixels, W, H, M, sz);
   const blob = pixelsToBlob(aligned, sz, sz, 'swapper');
 
-  // Compute latent: normed_emb @ emap, re-normalize
+  // Compute latent: normed_emb @ emap.
+  // Official InsightFace: np.dot(embedding, emap) where emap is (512,512) stored [in_dim, out_dim].
+  // Correct access: swapperEmap[k * dim + j] = emap[k, j] → result[j] = sum_k(embedding[k] * emap[k,j])
   const dim = 512;
   let latent;
   if (swapperEmap) {
@@ -662,9 +681,19 @@ async function runSwapper(pixels, W, H, kps, srcEmbedding) {
     let norm = 0;
     for (const v of latent) norm += v * v;
     norm = Math.sqrt(norm);
-    for (let i = 0; i < dim; i++) latent[i] /= norm;
+    if (norm > 1e-8) for (let i = 0; i < dim; i++) latent[i] /= norm;
   } else {
     latent = srcEmbedding;
+  }
+
+  // Diagnostic logging every 30 frames — does NOT affect output
+  _swapFrameCount++;
+  if (_swapFrameCount % 30 === 1) {
+    let latMin = Infinity, latMax = -Infinity, latNorm = 0;
+    for (const v of latent) { if (v < latMin) latMin = v; if (v > latMax) latMax = v; latNorm += v*v; }
+    let blobMin = Infinity, blobMax = -Infinity;
+    for (const v of blob) { if (v < blobMin) blobMin = v; if (v > blobMax) blobMax = v; }
+    console.log(`[Swap] frame=${_swapFrameCount} latent norm=${Math.sqrt(latNorm).toFixed(3)} range=[${latMin.toFixed(3)},${latMax.toFixed(3)}] blob=[${blobMin.toFixed(3)},${blobMax.toFixed(3)}]`);
   }
 
   const [inN0, inN1] = sessions.swapper.inputNames;
@@ -673,6 +702,16 @@ async function runSwapper(pixels, W, H, kps, srcEmbedding) {
     [inN0]: new Tensor('float32', blob,   [1, 3, sz, sz]),
     [inN1]: new Tensor('float32', latent, [1, dim]),
   });
+
+  // Diagnostic: log output range periodically
+  if (_swapFrameCount % 30 === 1) {
+    const pred = result[outN].data;
+    let predMin = Infinity, predMax = -Infinity, predMean = 0;
+    for (const v of pred) { if (v < predMin) predMin = v; if (v > predMax) predMax = v; predMean += v; }
+    predMean /= pred.length;
+    console.log(`[Swap] output range=[${predMin.toFixed(3)},${predMax.toFixed(3)}] mean=${predMean.toFixed(3)} inputs=[${inN0},${inN1}] output=${outN}`);
+  }
+
   return { pred: result[outN].data, M, aligned };
 }
 
@@ -703,15 +742,38 @@ function gaussianBlur1ch(src, w, h, r) {
 }
 
 function pasteBack(targetPixels, W, H, pred, M, swapSize) {
-  const fakePx  = predToPixels(pred, swapSize);
-  const M_inv   = invertAffine(M);
-  const warped  = warpAffineBack(fakePx, swapSize, swapSize, M_inv, W, H);
+  const fakePx = predToPixels(pred, swapSize);
+  const [a, b, tx, c, d, ty] = M;
 
-  // Build raw mask from warped alpha
+  // Backward mapping: for each output pixel (x,y) in the full frame, apply M to get
+  // the corresponding canonical position in the 128×128 InSwapper output.
+  // This matches: cv2.warpAffine(bgr_fake, M, (W, H)) from the official InsightFace pipeline.
+  // Forward mapping (old warpAffineBack) produced holes for faces larger than 128px.
+  const warped  = new Uint8ClampedArray(W * H * 4);
   const rawMask = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) rawMask[i] = warped[i*4+3] > 0 ? 255 : 0;
 
-  // Erode 5px
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const sx = a * x + b * y + tx;
+      const sy = c * x + d * y + ty;
+      const x0 = Math.floor(sx), y0 = Math.floor(sy);
+      const x1 = x0 + 1,         y1 = y0 + 1;
+      if (x0 >= 0 && x1 < swapSize && y0 >= 0 && y1 < swapSize) {
+        const fx = sx - x0, fy = sy - y0;
+        const w00=(1-fx)*(1-fy), w10=fx*(1-fy), w01=(1-fx)*fy, w11=fx*fy;
+        const i00=(y0*swapSize+x0)*4, i10=(y0*swapSize+x1)*4;
+        const i01=(y1*swapSize+x0)*4, i11=(y1*swapSize+x1)*4;
+        const di = (y*W+x)*4;
+        warped[di]   = Math.round(w00*fakePx[i00]  +w10*fakePx[i10]  +w01*fakePx[i01]  +w11*fakePx[i11]);
+        warped[di+1] = Math.round(w00*fakePx[i00+1]+w10*fakePx[i10+1]+w01*fakePx[i01+1]+w11*fakePx[i11+1]);
+        warped[di+2] = Math.round(w00*fakePx[i00+2]+w10*fakePx[i10+2]+w01*fakePx[i01+2]+w11*fakePx[i11+2]);
+        warped[di+3] = 255;
+        rawMask[y*W+x] = 255;
+      }
+    }
+  }
+
+  // Erode 5px to remove boundary artifacts, then Gaussian blur for smooth blending
   const erR = 5;
   const eroded = new Float32Array(W * H);
   for (let y = 0; y < H; y++)
@@ -730,10 +792,10 @@ function pasteBack(targetPixels, W, H, pred, M, swapSize) {
 
   const out = new Uint8ClampedArray(W * H * 4);
   for (let i = 0; i < W * H; i++) {
-    const a = mask[i] / 255;
-    out[i*4]   = Math.round(a * warped[i*4]   + (1-a) * targetPixels[i*4]);
-    out[i*4+1] = Math.round(a * warped[i*4+1] + (1-a) * targetPixels[i*4+1]);
-    out[i*4+2] = Math.round(a * warped[i*4+2] + (1-a) * targetPixels[i*4+2]);
+    const alpha = mask[i] / 255;
+    out[i*4]   = Math.round(alpha * warped[i*4]   + (1-alpha) * targetPixels[i*4]);
+    out[i*4+1] = Math.round(alpha * warped[i*4+1] + (1-alpha) * targetPixels[i*4+1]);
+    out[i*4+2] = Math.round(alpha * warped[i*4+2] + (1-alpha) * targetPixels[i*4+2]);
     out[i*4+3] = 255;
   }
   return out;
@@ -806,7 +868,9 @@ export async function registerReferenceFace(imageBuffer) {
 
   console.log('[FaceSwap] Best face bbox:', best.x1.toFixed(0), best.y1.toFixed(0), best.x2.toFixed(0), best.y2.toFixed(0));
   referenceEmbedding = await getEmbedding(data, width, height, best.kps);
-  console.log('[FaceSwap] Embedding created, dim:', referenceEmbedding.length);
+  let embNorm = 0, embMin = Infinity, embMax = -Infinity;
+  for (const v of referenceEmbedding) { embNorm += v*v; if (v<embMin) embMin=v; if (v>embMax) embMax=v; }
+  console.log(`[FaceSwap] Reference embedding: dim=${referenceEmbedding.length} norm=${Math.sqrt(embNorm).toFixed(4)} range=[${embMin.toFixed(4)},${embMax.toFixed(4)}] first3=[${referenceEmbedding[0].toFixed(4)},${referenceEmbedding[1].toFixed(4)},${referenceEmbedding[2].toFixed(4)}]`);
   return { success: true, bbox: { x1: best.x1, y1: best.y1, x2: best.x2, y2: best.y2 } };
 }
 
