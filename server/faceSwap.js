@@ -363,20 +363,29 @@ function warpAffineBack(pixels, srcW, srcH, M_inv, outW, outH) {
 // ─── ONNX helpers ─────────────────────────────────────────────────────────────
 
 /**
- * Convert RGBA pixel array to CHW float32 blob.
- * Both ArcFace and InSwapper use cv2.dnn.blobFromImage with swapRB=True, meaning
- * they expect **RGB** channel order. Normalization: (x - 127.5) / 127.5 → range [-1, 1].
+ * Convert RGBA pixel array to CHW float32 blob, RGB channel order.
+ *
+ * ArcFace:   blobFromImage(img, 1/128, 112x112, mean=(127.5,127.5,127.5), swapRB=True)
+ *            → (x - 127.5) / 128, range ≈ [-1, 1]
+ *
+ * InSwapper: blobFromImage(img, 1/255, 128x128, mean=(0,0,0), swapRB=True)
+ *            → x / 255, range [0, 1]
  */
 function pixelsToBlob(pixels, w, h, norm) {
   const n = w * h;
   const blob = new Float32Array(3 * n);
-  const std = norm === 'arcface' ? 128 : 127.5;
   for (let i = 0; i < n; i++) {
     const r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2];
-    // RGB order — channel 0=R, 1=G, 2=B
-    blob[i]         = (r - 127.5) / std;
-    blob[n + i]     = (g - 127.5) / std;
-    blob[2 * n + i] = (b - 127.5) / std;
+    if (norm === 'arcface') {
+      blob[i]         = (r - 127.5) / 128;
+      blob[n + i]     = (g - 127.5) / 128;
+      blob[2 * n + i] = (b - 127.5) / 128;
+    } else {
+      // InSwapper: scale to [0, 1], no mean subtraction
+      blob[i]         = r / 255.0;
+      blob[n + i]     = g / 255.0;
+      blob[2 * n + i] = b / 255.0;
+    }
   }
   return blob;
 }
